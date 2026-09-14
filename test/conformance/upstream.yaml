@@ -21,6 +21,31 @@ verification:
     conformance: mise run test-conformance
     regenerate: mise run generate-conformance
 knownGaps:
+  - id: astra-model-catalog
+    surface: provider-openai
+    status: intentional-deviation
+    description: GPT-6 Astra is added to the advisory Responses model list and
+      Bedrock Mantle compatibility-path table ahead of the registered upstream
+      baseline. AWS documents
+      openai.gpt-6-astra at /openai/v1 in us-west-2. Routing and capabilities are
+      covered by synthetic unit tests; no live Astra conformance recording exists.
+  - id: gpt6-non-reasoning-parameters
+    surface: provider-openai
+    status: intentional-deviation
+    description: GPT-6 and later disable non-reasoning sampling parameters, matching
+      newer upstream commit 6c6c2210b9532a4c369615c044a16d595f3db117 rather than the
+      registered @ai-sdk/openai 4.0.41 baseline. Synthetic request tests verify
+      temperature and topP are stripped even for reasoning effort none, while
+      GPT-5.1+ behavior is preserved.
+  - id: gpt6-newer-upstream-capabilities
+    surface: provider-openai
+    status: gap
+    description: Newer upstream commit 6c6c2210b9532a4c369615c044a16d595f3db117
+      advertises GPT-6 supportedReasoningEfforts (low, medium, high, xhigh, max),
+      supportsConfigurationUpdate, and supportsAsyncToolCalling. These newer
+      capability contracts are not implemented by this change; reasoning-effort
+      validation and the configuration-update and async-tool-calling behavior
+      remain follow-up work against a newer upstream baseline.
   - id: anthropic-base-url-normalization
     surface: provider-anthropic
     status: gap

@@ -20,6 +20,7 @@ const responsesProviderName = "bedrock-mantle.responses"
 // family. Before changing this allowlist, verify the model card's Programmatic
 // Access endpoint and update TestNewResponses_DefaultRoutes with the same ID.
 var openAICompatibilityPathModels = map[string]struct{}{
+	"openai.gpt-6-astra":               {},
 	"google.gemma-4-26b-a4b":           {},
 	"google.gemma-4-31b":               {},
 	"google.gemma-4-e2b":               {},
