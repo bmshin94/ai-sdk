@@ -109,15 +109,39 @@ The following differences are explicit rather than claims of complete parity:
   its fixed-prose privacy policy. Unknown metadata is ignored. SSE framing
   supports LF, CRLF, bare CR, BOM, and ignored event/id fields; complete-event
   limits count CRLF-normalized bytes while the total limit counts wire bytes.
-- Coverage gaps: differential tests reuse the comprehensive pinned request
-  golden and selected request cases, normal/ordered-error SSE behavior, and all
-  11 registered HTTP errors, not every union
-  permutation or cancellation schedule. Real-command tests exercise selected
-  public error statuses, not all 11. Hostile limits and cancellation races are
-  focused Go evidence, not provider-provenance fixtures. The baseline validator
-  does not yet automatically tie every future contract change to the client;
-  compile-time/reflection request-field witnesses and provider-shape checks are
-  the current drift guards.
+- Cancellation adaptation: Go preserves `context.Canceled` directly; the pinned
+  client can wrap the underlying `AbortError` in its internal error. Both avoid
+  I/O when pre-aborted, cancel an in-flight unary request, and close an established
+  stream without fabricating a provider error. Aggregate Go tests exercise 128
+  blocked readers and 128 blocked consumers and verify owner/body cleanup against
+  both stack-specific and process goroutine baselines, including a live-owner
+  negative control.
+- Request evidence: the comprehensive pinned golden and selected request cases
+  cover scalar/collection presence, selected bytes/URL/reference/text, opaque JSON,
+  and all seven protected headers in three casings across unary and streaming.
+  Isolated source-mutation controls rerun the same differential assertions and
+  require semantic failures for body headers, scalar presence, reasoning omission,
+  native byte conversion, URLs, opaque options, call-header precedence, and the
+  stream flag. These reproducible red controls supplement the implementation's
+  original red-first history; they do not claim newly invented historical TDD.
+- Drift detection: the compile-time `CallOptions` struct conversion witness
+  catches top-level fields. Go string constants are not compiler-sealed enums;
+  an executable AST inventory instead locks all 22 reachable request declarations
+  and 47 finite constants, with explicit mapped/omitted/rejected classifications.
+  Baseline validation rejects nested field/discriminator changes and changes to
+  the upstream commit or gateway/provider/provider-utils pins until the reviewed
+  client evidence is updated. Mutation tests prove these failures independently.
+- Coverage limits: generic HTTP differential tests cover all 11 registered error
+  rows. The real command covers 10: 400, 401, 404, 424, 429, 499, 500, 502, 503,
+  and 504. Its production composition has no permission policy producing 403;
+  that row remains generic-runtime/client evidence, not fabricated command
+  coverage. Closed command results, discovery, request/response metadata, stream
+  parts, public errors, logs, and metrics are scanned for credentials and private
+  backend/topology markers. Arbitrary application text and bounded raw responses
+  remain caller-visible by contract; the client does not promise to redact every
+  possible secret returned by an untrusted endpoint. Hostile limits and cancellation
+  schedules are focused Go evidence, not provider-provenance fixtures; exhaustive
+  union permutations and every possible scheduling interleaving are not claimed.
 
 No provider recordings or provenance fixtures were fabricated or regenerated.
 

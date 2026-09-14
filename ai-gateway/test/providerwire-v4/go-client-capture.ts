@@ -2,10 +2,10 @@ import { execFileSync, spawn } from "node:child_process";
 import { join, resolve } from "node:path";
 import nodeProcess from "node:process";
 
-export function buildGoClientCapture(directory: string): string {
+export function buildGoClientCapture(directory: string, sourceDirectory = resolve(import.meta.dirname, "../../../providers/grafana")): string {
   const binary = join(directory, "go-client-capture");
   execFileSync("go", ["build", "-o", binary, "./internal/capture"], {
-    cwd: resolve(import.meta.dirname, "../../../providers/grafana"),
+    cwd: sourceDirectory,
     env: { ...nodeProcess.env, GOWORK: "off", GOFLAGS: "-mod=readonly" },
     stdio: "pipe",
   });

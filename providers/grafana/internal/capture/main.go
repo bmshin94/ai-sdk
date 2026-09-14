@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -23,13 +24,38 @@ func main() {
 		Options         provider.CallOptions     `json:"options"`
 		Headers         map[string][]string      `json:"headers"`
 		AbortAfterParts int                      `json:"abortAfterParts"`
+		AbortBefore     bool                     `json:"abortBefore"`
+		CancelAfterMS   int                      `json:"cancelAfterMs"`
+		PreferBytes     bool                     `json:"preferBytes"`
 	}
 	if err := json.NewDecoder(io.LimitReader(os.Stdin, 1<<20)).Decode(&input); err != nil {
 		emit(map[string]any{"error": map[string]any{"message": "invalid capture input"}})
 		return
 	}
+	if input.PreferBytes {
+		for messageIndex := range input.Options.Prompt {
+			for partIndex := range input.Options.Prompt[messageIndex].Content {
+				data := input.Options.Prompt[messageIndex].Content[partIndex].Data
+				if data != nil && data.Base64 != "" {
+					decoded, err := base64.StdEncoding.DecodeString(data.Base64)
+					if err != nil {
+						emit(map[string]any{"error": map[string]any{"message": "invalid capture binary input"}})
+						return
+					}
+					data.Bytes, data.Base64 = decoded, ""
+				}
+			}
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if input.AbortBefore {
+		cancel()
+	}
+	if input.CancelAfterMS > 0 {
+		stop := time.AfterFunc(time.Duration(input.CancelAfterMS)*time.Millisecond, cancel)
+		defer stop.Stop()
+	}
 	if input.UserIDToken != "" {
 		ctx = grafana.WithUserIDToken(ctx, input.UserIDToken)
 	}
@@ -71,7 +97,7 @@ func main() {
 				cancel()
 			}
 		}
-		emit(map[string]any{"parts": parts, "request": result.Request, "response": result.Response})
+		emit(map[string]any{"parts": parts, "request": result.Request, "response": result.Response, "canceled": ctx.Err() != nil})
 		return
 	}
 	result, err := model.DoGenerate(ctx, input.Options)
@@ -94,7 +120,13 @@ func emitError(err error) {
 	if errors.As(err, &api) {
 		value["statusCode"] = api.StatusCode
 		value["isRetryable"] = api.IsRetryable
+		value["apiError"] = api
 	}
+	causes := make([]string, 0)
+	for cause := errors.Unwrap(err); cause != nil && len(causes) < 16; cause = errors.Unwrap(cause) {
+		causes = append(causes, cause.Error())
+	}
+	value["causes"] = causes
 	value["canceled"] = errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 	emit(map[string]any{"error": value})
 }

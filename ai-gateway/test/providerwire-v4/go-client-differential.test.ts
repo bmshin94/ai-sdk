@@ -12,7 +12,7 @@ import { assertValidRequest } from "./schema";
 
 let directory: string;
 let binary: string;
-before(() => { directory = mkdtempSync(join(tmpdir(), "wp7-go-differential-")); binary = buildGoClientCapture(directory); });
+before(() => { directory = mkdtempSync(join(tmpdir(), "wp7-go-differential-")); binary = buildGoClientCapture(directory, process.env.GRAFANA_CLIENT_MUTATION_SOURCE); });
 after(() => { rmSync(directory, { recursive: true, force: true }); });
 
 const unary = {
@@ -48,7 +48,111 @@ function goOptions(options: LanguageModelV4CallOptions): unknown {
   return JSON.parse(JSON.stringify(options, (_key, value: unknown) => value instanceof Uint8Array ? Buffer.from(value).toString("base64") : value));
 }
 
+async function cancellationEndpoint(streaming: boolean) {
+  let requests = 0;
+  let closed = 0;
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request) { /* consume request before observing cancellation */ }
+    requests++;
+    response.once("close", () => { closed++; });
+    if (streaming) {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write('data: {"type":"text-start","id":"first"}\n\n');
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address(); assert.ok(address && typeof address !== "string");
+  return {
+    baseURL: `http://127.0.0.1:${address.port}/api/v1/aisdk`,
+    requests: () => requests,
+    closed: () => closed,
+    stop: async () => { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); },
+  };
+}
+
+function hasAbortCause(error: any): boolean {
+  for (let current = error, depth = 0; current != null && depth < 10; current = current.cause, depth++) {
+    if (current.name === "AbortError") return true;
+  }
+  return false;
+}
+
+async function eventually(check: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + 3_000;
+  while (!check()) {
+    assert.ok(Date.now() < deadline, label);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 describe("Go and exact-pinned Gateway differential", () => {
+  it("covers every protected header with lower, upper, and canonical casing in both call modes", async () => {
+    const protectedNames = ["x-access-token", "x-grafana-id", "content-type", "accept", "ai-language-model-id", "ai-language-model-specification-version", "ai-language-model-streaming"];
+    const casings = [(name: string) => name, (name: string) => name.toUpperCase(), (name: string) => name.split("-").map((part) => part[0]!.toUpperCase() + part.slice(1)).join("-")];
+    let classifiedOwnershipDifferences = 0;
+    for (const streaming of [false, true]) {
+      for (const header of protectedNames) for (const casing of casings) {
+        const key = casing(header);
+        const server = await endpoint(streaming ? 'data: {"type":"text-start","id":"a"}\n\n' : JSON.stringify(unary), 200, streaming ? "text/event-stream" : "application/json");
+        try {
+          const headers = { [key]: "call-injection", "x-custom": "call", "x-empty": "" };
+          const options = { prompt: [], headers };
+          const tsModel = createGateway({ apiKey: "test", baseURL: server.baseURL, headers: { "x-access-token": "token", "x-grafana-id": "user", "x-custom": "configured", [key]: "configured-injection" } })("assistant");
+          const ts = streaming ? await tsModel.doStream(options) : await tsModel.doGenerate(options);
+          if ("stream" in ts) for await (const _part of ts.stream) { /* drain the actual pinned client */ }
+          const go = await captureGoClient(binary, { baseURL: server.baseURL, accessToken: "token", userIDToken: "user", modelID: "assistant", mode: streaming ? "stream" : "generate", headers: { [key]: ["configured-injection"], "x-custom": ["configured"] }, options });
+          assert.equal(go.error, undefined);
+          const actual = server.requests[1]!;
+          const expected: Record<string, string> = { "x-access-token": "token", "x-grafana-id": "user", "content-type": "application/json", accept: streaming ? "text/event-stream" : "application/json", "ai-language-model-id": "assistant", "ai-language-model-specification-version": "4", "ai-language-model-streaming": String(streaming) };
+          for (const name of protectedNames) assert.equal(actual.headers[name], expected[name], `${key}: ${name} must have one client-owned value`);
+          assert.equal(actual.headers["x-custom"], "call");
+          assert.equal(actual.headers["x-empty"], "");
+          assert.deepEqual((actual.body as any).headers, headers);
+          assert.deepEqual((ts.request?.body as any).headers, headers);
+          assert.deepEqual((streaming ? go.request : go.result.request).body.headers, headers);
+          if (server.requests[0]!.headers[header] !== actual.headers[header]) classifiedOwnershipDifferences++;
+          assertValidRequest(actual.body, "protected header request");
+        } finally { await server.stop(); }
+      }
+    }
+    assert.ok(classifiedOwnershipDifferences > 0, "pinned permissive header overrides differ intentionally from protected Go ownership");
+  });
+
+  it("preserves cancellation before I/O, during unary reads, and after the first stream part", async () => {
+    for (const streaming of [false, true]) {
+      const server = await cancellationEndpoint(streaming);
+      try {
+        const client = createGateway({ apiKey: "test", baseURL: server.baseURL })("assistant");
+        const options = { prompt: [], abortSignal: AbortSignal.abort() };
+        await assert.rejects(Promise.resolve(streaming ? client.doStream(options) : client.doGenerate(options)), hasAbortCause);
+        const before = await captureGoClient(binary, { baseURL: server.baseURL, accessToken: "token", modelID: "assistant", mode: streaming ? "stream" : "generate", options: { prompt: [] }, abortBefore: true });
+        assert.equal(before.error?.canceled, true);
+        assert.equal(server.requests(), 0);
+        if (!streaming) {
+          const controller = new AbortController();
+          const pending = client.doGenerate({ prompt: [], abortSignal: controller.signal });
+          await eventually(() => server.requests() === 1, "TypeScript unary entered transport");
+          controller.abort();
+          await assert.rejects(Promise.resolve(pending), hasAbortCause);
+          const go = await captureGoClient(binary, { baseURL: server.baseURL, accessToken: "token", modelID: "assistant", mode: "generate", options: { prompt: [] }, cancelAfterMs: 100 });
+          assert.equal(go.error?.canceled, true);
+        } else {
+          const controller = new AbortController();
+          const result = await client.doStream({ prompt: [], abortSignal: controller.signal });
+          const reader = result.stream.getReader();
+          const first = await reader.read();
+          controller.abort();
+          await assert.rejects(reader.read(), hasAbortCause);
+          const go = await captureGoClient(binary, { baseURL: server.baseURL, accessToken: "token", modelID: "assistant", mode: "stream", options: { prompt: [] }, abortAfterParts: 1 });
+          assert.deepEqual(go.parts, [first.value]);
+          assert.equal(go.canceled, true);
+        }
+        await eventually(() => server.closed() === 2, "both canceled transports close");
+        assert.equal(server.requests(), 2, "cancellation must never trigger retries");
+      } finally { await server.stop(); }
+    }
+  });
+
   it("projects the existing comprehensive pinned request golden with explicit Go presence gaps", async () => {
     const captured = (await comprehensiveGoldenCase.capture())[0]!;
     const original = captured.body as Record<string, any>;
@@ -89,7 +193,7 @@ describe("Go and exact-pinned Gateway differential", () => {
       const requestOptions = testCase.name.includes("file") ? testCase.options : structuredClone(testCase.options);
       const input = goOptions(requestOptions);
       const ts = await client("assistant").doGenerate(requestOptions);
-      const go = await captureGoClient(binary, { baseURL: server.baseURL, accessToken: "access-token", userIDToken: "acting-user", modelID: "assistant", mode: "generate", headers: { "x-configured": ["configured"] }, options: input });
+      const go = await captureGoClient(binary, { baseURL: server.baseURL, accessToken: "access-token", userIDToken: "acting-user", modelID: "assistant", mode: "generate", headers: { "x-configured": ["configured"] }, options: input, preferBytes: testCase.name.includes("file") });
       assert.equal(go.error, undefined);
       assert.deepEqual(semanticRequest(server.requests[1]!), semanticRequest(server.requests[0]!));
       assert.deepEqual(go.result.content.map((part: { type: string; text?: string }) => ({ type: part.type, text: part.text ?? "" })), ts.content);

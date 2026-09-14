@@ -14,6 +14,7 @@ const AI_GATEWAY_ROOT = resolve(import.meta.dirname, "../..");
 const COMMAND_DIR = resolve(AI_GATEWAY_ROOT, "cmd/grafana-ai-gateway");
 const READY_TIMEOUT_MS = 15_000;
 const TEST_TOKEN = unsafeAccessToken();
+const TEST_USER_TOKEN = unsafeUserIDToken();
 
 let buildDirectory: string;
 let binaryPath: string;
@@ -39,6 +40,59 @@ after(() => {
 });
 
 describe("authenticated Anthropic Gateway command", () => {
+  it("maps the reachable Go public error matrix for unary and stream setup", async () => {
+    const [fake, gateway] = await startGateway();
+    const rows = [
+      { upstream: 400, status: 424, category: "failed_dependency", code: "failed_dependency", retryable: false },
+      { upstream: 429, status: 429, category: "rate_limit_exceeded", code: "rate_limit_exceeded", retryable: true },
+      { upstream: 500, status: 502, category: "internal_server_error", code: "upstream_error", retryable: true },
+      { upstream: 503, status: 503, category: "internal_server_error", code: "overloaded", retryable: true },
+      { upstream: 408, status: 504, category: "internal_server_error", code: "timeout", retryable: true },
+    ];
+    try {
+      for (const row of rows) {
+        fake.failureStatus = row.upstream;
+        for (const mode of ["generate", "stream"] as const) {
+          const options = { prompt: [{ role: "user" as const, content: [{ type: "text" as const, text: "public-error-matrix" }] }], maxOutputTokens: 32 };
+          const go = await captureGoClient(goClientBinaryPath, { baseURL: `${gateway.url}/api/v1/aisdk`, accessToken: TEST_TOKEN, userIDToken: TEST_USER_TOKEN, mode, modelID: "assistant", options });
+          assert.deepEqual({ status: go.error?.statusCode, category: go.error?.category, code: go.error?.code, retryable: go.error?.isRetryable }, { status: row.status, category: row.category, code: row.code, retryable: row.retryable });
+          let ts: any;
+          try {
+            const model = gateway.client()("assistant");
+            await (mode === "generate" ? model.doGenerate(options) : model.doStream(options));
+          } catch (error) { ts = error; }
+          assert.ok(ts);
+          assert.deepEqual({ status: go.error.statusCode, category: go.error.category, retryable: go.error.isRetryable }, { status: ts.statusCode, category: ts.type, retryable: ts.isRetryable });
+          assertPrivateValuesAbsent([go, ts], fake);
+        }
+      }
+      assert.equal(fake.requests.length, rows.length * 4, "neither client nor service should retry model calls");
+      const metrics = await (await fetch(`${gateway.url}/metrics`)).text();
+      await gateway.stop();
+      assertPrivateValuesAbsent([gateway.stderr, metrics], fake);
+      assert.deepEqual(fake.violations, []);
+    } finally { await settleCleanup(() => gateway.stop(), () => fake.stop()); }
+  });
+
+  it("returns Go internal error for bounded discovery and cancellation on process shutdown", async () => {
+    const [fake, gateway] = await startGateway(["--discovery.response-bytes=256"]);
+    const base = { baseURL: `${gateway.url}/api/v1/aisdk`, accessToken: TEST_TOKEN };
+    try {
+      const discovery = await captureGoClient(goClientBinaryPath, { ...base, mode: "discovery" });
+      assert.equal(discovery.error?.statusCode, 500);
+      assert.equal(discovery.error?.code, "internal_error");
+      const pending = captureGoClient(goClientBinaryPath, { ...base, mode: "generate", modelID: "assistant", options: { prompt: [{ role: "user", content: [{ type: "text", text: "silent-unary-shutdown" }] }], maxOutputTokens: 32 } });
+      await poll(async () => fake.requests.some((request) => JSON.stringify(request.body).includes("silent-unary-shutdown")), 5_000, "pending unary before shutdown");
+      const stopped = gateway.stop();
+      const canceled = await pending;
+      assert.equal(canceled.error?.statusCode, 499);
+      assert.equal(canceled.error?.code, "canceled");
+      assert.equal(canceled.error?.isRetryable, false);
+      await stopped;
+      assertPrivateValuesAbsent([discovery, canceled, gateway.stderr], fake);
+    } finally { await settleCleanup(() => gateway.stop(), () => fake.stop()); }
+  });
+
   it("serves Go discovery, canonical/alias unary, streaming, cancellation, and public errors", async () => {
     const [fake, gateway] = await startGateway();
     const base = { baseURL: `${gateway.url}/api/v1/aisdk`, accessToken: TEST_TOKEN };
@@ -46,7 +100,7 @@ describe("authenticated Anthropic Gateway command", () => {
       const discovery = await captureGoClient(goClientBinaryPath, { ...base, mode: "discovery" });
       assert.equal(discovery.error, undefined);
       assert.deepEqual(discovery.models.map((model: { id: string }) => model.id), ["assistant", "grafana/assistant"]);
-      const actingUser = await captureGoClient(goClientBinaryPath, { ...base, mode: "discovery", userIDToken: unsafeUserIDToken() });
+      const actingUser = await captureGoClient(goClientBinaryPath, { ...base, mode: "discovery", userIDToken: TEST_USER_TOKEN });
       assert.equal(actingUser.error, undefined); assert.equal(actingUser.models.length, 2);
       const invalidUser = await captureGoClient(goClientBinaryPath, { ...base, mode: "discovery", userIDToken: "invalid-user-token" });
       assert.equal(invalidUser.error.category, "authentication_error");
@@ -55,6 +109,7 @@ describe("authenticated Anthropic Gateway command", () => {
         assert.equal(result.error, undefined);
         assert.deepEqual(result.result.content, [{ type: "text", text: "hello from fake Anthropic" }]);
         assert.equal(result.result.response.modelId, undefined);
+        assertPrivateValuesAbsent(result, fake);
       }
       const stream = await captureGoClient(goClientBinaryPath, { ...base, mode: "stream", modelID: "assistant", options: { prompt: [{ role: "user", content: [{ type: "text", text: "normal-stream" }] }], maxOutputTokens: 32 } });
       assert.equal(stream.error, undefined);
@@ -71,11 +126,10 @@ describe("authenticated Anthropic Gateway command", () => {
       assert.equal(invalid.error.category, "invalid_request_error"); assert.equal(invalid.error.statusCode, 400);
       const unauthorized = await captureGoClient(goClientBinaryPath, { ...base, accessToken: "invalid-token", mode: "discovery" });
       assert.equal(unauthorized.error.category, "authentication_error"); assert.equal(unauthorized.error.statusCode, 401);
-      for (const value of [discovery, actingUser, invalidUser, stream, abort, missing, invalid, unauthorized]) {
-        const serialized = JSON.stringify(value);
-        for (const secret of [TEST_TOKEN, "integration-anthropic-key", "backend-private", fake.url]) assert.ok(!serialized.includes(secret));
-      }
       assert.deepEqual(fake.violations, []); assert.equal(await gateway.ready(), true);
+      const metrics = await (await fetch(`${gateway.url}/metrics`)).text();
+      await gateway.stop();
+      assertPrivateValuesAbsent([discovery, actingUser, invalidUser, stream, abort, missing, invalid, unauthorized, metrics, gateway.stderr], fake, ["invalid-user-token", "invalid-token"]);
     } finally { await settleCleanup(() => gateway.stop(), () => fake.stop()); }
   });
 
@@ -94,7 +148,10 @@ describe("authenticated Anthropic Gateway command", () => {
       const address = exchange.address(); assert.ok(address && typeof address !== "string");
       const result = await captureGoClient(goClientBinaryPath, { mode: "discovery", cloud: { CAPToken: "integration-cap", Namespace: "stack-integration", BaseURL: `${gateway.url}/api/v1/aisdk`, TokenExchangeURL: `http://127.0.0.1:${address.port}/exchange/` } });
       assert.equal(result.error, undefined); assert.equal(result.models.length, 2); assert.equal(exchanges, 1);
-      assert.equal(fake.requests.length, 0); assert.ok(!JSON.stringify(result).includes(TEST_TOKEN));
+      assert.equal(fake.requests.length, 0);
+      const metrics = await (await fetch(`${gateway.url}/metrics`)).text();
+      await gateway.stop();
+      assertPrivateValuesAbsent([result, metrics, gateway.stderr], fake, [`http://127.0.0.1:${address.port}/exchange/`]);
     } finally {
       await new Promise<void>((resolve, reject) => exchange.close((error) => error ? reject(error) : resolve()));
       await settleCleanup(() => gateway.stop(), () => fake.stop());
@@ -342,6 +399,13 @@ async function startGateway(extraArgs: string[] = []): Promise<[FakeAnthropic, G
   }
 }
 
+function assertPrivateValuesAbsent(value: unknown, fake: FakeAnthropic, extra: string[] = []): void {
+  const serialized = JSON.stringify(value);
+  for (const secret of [TEST_TOKEN, TEST_USER_TOKEN, "integration-cap", "integration-anthropic-key", "GATEWAY_TEST_ANTHROPIC_KEY", "anthropic-primary", "backend-private", "provider-secret-response", fake.url, ...extra]) {
+    assert.ok(!serialized.includes(secret), "private value escaped into a client/service surface");
+  }
+}
+
 async function settleCleanup(...actions: Array<() => Promise<void>>): Promise<void> {
   const results = await Promise.allSettled(actions.map((action) => action()));
   const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
@@ -490,6 +554,7 @@ class FakeAnthropic {
   readonly canceled = new Set<string>();
   redirectTo?: string;
   oversizedErrors = false;
+  failureStatus?: number;
   private readonly server: ReturnType<typeof createServer>;
 
   private constructor(server: ReturnType<typeof createServer>, url: string) {
@@ -521,12 +586,23 @@ class FakeAnthropic {
     for await (const chunk of request) chunks.push(Buffer.from(chunk));
     const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
     const serialized = JSON.stringify(body);
-    const marker = ["silent-abort", "silent-shutdown", "normal-stream", "redirect", "oversized"]
+    const marker = ["silent-abort", "silent-shutdown", "silent-unary-shutdown", "normal-stream", "redirect", "oversized"]
       .find((value) => serialized.includes(value));
     this.requests.push({ path: request.url ?? "", apiKey: singleHeader(request.headers["x-api-key"]), body });
     if (request.url !== "/v1/messages?beta=true") this.violations.push(`path=${request.url}`);
     if (singleHeader(request.headers["x-api-key"]) !== "integration-anthropic-key") this.violations.push("api-key");
     if (body.model !== "backend-private") this.violations.push(`model=${String(body.model)}`);
+    if (request.headers["x-access-token"] != null || request.headers["x-grafana-id"] != null) this.violations.push("forwarded-caller-credential");
+
+    if (this.failureStatus != null) {
+      response.writeHead(this.failureStatus, { "Content-Type": "application/json", "x-private-provider": "backend-private" });
+      response.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "provider-secret-response integration-anthropic-key backend-private" }, request_id: "backend-private-request" }));
+      return;
+    }
+    if (marker === "silent-unary-shutdown") {
+      response.once("close", () => this.canceled.add(marker));
+      return;
+    }
 
     if (this.redirectTo != null) {
       response.writeHead(307, { Location: this.redirectTo });
