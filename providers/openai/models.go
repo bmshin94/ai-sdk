@@ -57,7 +57,7 @@ func getOpenAIModelCapabilities(modelID string) modelCapabilities {
 		(hasGPTVersion && gpt.major >= 5 && !isGPTNano && !isGPTChat) ||
 		(hasOSeriesVersion && oVersion >= 3)
 	supportsNonReasoningParams := hasGPTVersion &&
-		(gpt.major > 5 || (gpt.major == 5 && gpt.minor != nil && *gpt.minor >= 1))
+		gpt.major == 5 && gpt.minor != nil && *gpt.minor >= 1
 
 	mode := "system"
 	if isReasoning {

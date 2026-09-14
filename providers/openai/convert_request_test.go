@@ -1346,12 +1346,15 @@ func TestBuildParams_BedrockMantleRejectsUnsupportedServiceTiers(t *testing.T) {
 	}
 }
 
-func TestBuildParams_BedrockMantleReasoningNoneStripsSamplingParameters(t *testing.T) {
+func TestBuildParams_ReasoningNoneSamplingParameters(t *testing.T) {
 	tests := []struct {
 		modelID      string
 		wantSampling bool
 	}{
 		{modelID: "gpt-5.6-luna", wantSampling: true},
+		{modelID: "gpt-6-astra", wantSampling: false},
+		{modelID: "gpt-99", wantSampling: false},
+		{modelID: "openai.gpt-6-astra", wantSampling: false},
 		{modelID: "openai.gpt-5.6-luna", wantSampling: false},
 	}
 
