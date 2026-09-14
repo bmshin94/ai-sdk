@@ -8,6 +8,7 @@ import { join, resolve } from "node:path";
 import nodeProcess from "node:process";
 import { after, before, describe, it } from "node:test";
 import { createGateway } from "@ai-sdk/gateway";
+import { buildGoClientCapture, captureGoClient } from "./go-client-capture";
 
 const AI_GATEWAY_ROOT = resolve(import.meta.dirname, "../..");
 const COMMAND_DIR = resolve(AI_GATEWAY_ROOT, "cmd/grafana-ai-gateway");
@@ -16,6 +17,7 @@ const TEST_TOKEN = unsafeAccessToken();
 
 let buildDirectory: string;
 let binaryPath: string;
+let goClientBinaryPath: string;
 
 before(() => {
   buildDirectory = mkdtempSync(join(tmpdir(), "grafana-ai-gateway-build-"));
@@ -29,6 +31,7 @@ before(() => {
       GOFLAGS: `${nodeProcess.env.GOFLAGS ? `${nodeProcess.env.GOFLAGS} ` : ""}-mod=readonly`,
     },
   });
+  goClientBinaryPath = buildGoClientCapture(buildDirectory);
 });
 
 after(() => {
@@ -36,6 +39,68 @@ after(() => {
 });
 
 describe("authenticated Anthropic Gateway command", () => {
+  it("serves Go discovery, canonical/alias unary, streaming, cancellation, and public errors", async () => {
+    const [fake, gateway] = await startGateway();
+    const base = { baseURL: `${gateway.url}/api/v1/aisdk`, accessToken: TEST_TOKEN };
+    try {
+      const discovery = await captureGoClient(goClientBinaryPath, { ...base, mode: "discovery" });
+      assert.equal(discovery.error, undefined);
+      assert.deepEqual(discovery.models.map((model: { id: string }) => model.id), ["assistant", "grafana/assistant"]);
+      const actingUser = await captureGoClient(goClientBinaryPath, { ...base, mode: "discovery", userIDToken: unsafeUserIDToken() });
+      assert.equal(actingUser.error, undefined); assert.equal(actingUser.models.length, 2);
+      const invalidUser = await captureGoClient(goClientBinaryPath, { ...base, mode: "discovery", userIDToken: "invalid-user-token" });
+      assert.equal(invalidUser.error.category, "authentication_error");
+      for (const modelID of ["assistant", "grafana/assistant"]) {
+        const result = await captureGoClient(goClientBinaryPath, { ...base, mode: "generate", modelID, options: { prompt: [{ role: "user", content: [{ type: "text", text: "unary" }] }], maxOutputTokens: 32, temperature: 0.2 } });
+        assert.equal(result.error, undefined);
+        assert.deepEqual(result.result.content, [{ type: "text", text: "hello from fake Anthropic" }]);
+        assert.equal(result.result.response.modelId, undefined);
+      }
+      const stream = await captureGoClient(goClientBinaryPath, { ...base, mode: "stream", modelID: "assistant", options: { prompt: [{ role: "user", content: [{ type: "text", text: "normal-stream" }] }], maxOutputTokens: 32 } });
+      assert.equal(stream.error, undefined);
+      assert.equal(stream.parts[0].type, "stream-start");
+      assert.equal(stream.parts.at(-1).type, "finish");
+      assert.ok(stream.parts.filter((part: { type: string }) => part.type === "text-delta").map((part: { delta: string }) => part.delta).join("").includes("hello from fake Anthropic stream"));
+      const abort = await captureGoClient(goClientBinaryPath, { ...base, mode: "stream", modelID: "assistant", abortAfterParts: 1, options: { prompt: [{ role: "user", content: [{ type: "text", text: "silent-abort" }] }], maxOutputTokens: 32 } });
+      assert.equal(abort.error, undefined); assert.equal(abort.parts[0].type, "stream-start");
+      assert.ok(abort.parts.every((part: { type: string }) => part.type !== "error"));
+      await fake.waitForCancellation("silent-abort");
+      const missing = await captureGoClient(goClientBinaryPath, { ...base, mode: "generate", modelID: "missing", options: { prompt: [] } });
+      assert.equal(missing.error.category, "model_not_found"); assert.equal(missing.error.statusCode, 404);
+      const invalid = await captureGoClient(goClientBinaryPath, { ...base, mode: "generate", modelID: "assistant", options: { prompt: [], headers: { "x-call": "unsupported" } } });
+      assert.equal(invalid.error.category, "invalid_request_error"); assert.equal(invalid.error.statusCode, 400);
+      const unauthorized = await captureGoClient(goClientBinaryPath, { ...base, accessToken: "invalid-token", mode: "discovery" });
+      assert.equal(unauthorized.error.category, "authentication_error"); assert.equal(unauthorized.error.statusCode, 401);
+      for (const value of [discovery, actingUser, invalidUser, stream, abort, missing, invalid, unauthorized]) {
+        const serialized = JSON.stringify(value);
+        for (const secret of [TEST_TOKEN, "integration-anthropic-key", "backend-private", fake.url]) assert.ok(!serialized.includes(secret));
+      }
+      assert.deepEqual(fake.violations, []); assert.equal(await gateway.ready(), true);
+    } finally { await settleCleanup(() => gateway.stop(), () => fake.stop()); }
+  });
+
+  it("exchanges a CAP token through the Go client before authenticated discovery", async () => {
+    const [fake, gateway] = await startGateway();
+    let exchanges = 0;
+    const exchange = createServer(async (request, response) => {
+      exchanges++; assert.equal(request.headers.authorization, "Bearer integration-cap");
+      assert.equal(request.url, "/exchange/");
+      const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      assert.deepEqual(JSON.parse(Buffer.concat(chunks).toString()), { namespace: "stack-integration", audiences: ["ai-sdk"] });
+      response.writeHead(200, { "content-type": "application/json" }); response.end(JSON.stringify({ data: { token: TEST_TOKEN } }));
+    });
+    await new Promise<void>((resolve) => exchange.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = exchange.address(); assert.ok(address && typeof address !== "string");
+      const result = await captureGoClient(goClientBinaryPath, { mode: "discovery", cloud: { CAPToken: "integration-cap", Namespace: "stack-integration", BaseURL: `${gateway.url}/api/v1/aisdk`, TokenExchangeURL: `http://127.0.0.1:${address.port}/exchange/` } });
+      assert.equal(result.error, undefined); assert.equal(result.models.length, 2); assert.equal(exchanges, 1);
+      assert.equal(fake.requests.length, 0); assert.ok(!JSON.stringify(result).includes(TEST_TOKEN));
+    } finally {
+      await new Promise<void>((resolve, reject) => exchange.close((error) => error ? reject(error) : resolve()));
+      await settleCleanup(() => gateway.stop(), () => fake.stop());
+    }
+  });
+
   it("discovers and invokes every canonical and alias model ID", async () => {
     const [fake, gateway] = await startGateway();
     try {
@@ -526,6 +591,12 @@ function unsafeAccessToken(): string {
     namespace: "stack-integration",
     serviceIdentity: "integration-service",
   })).toString("base64url");
+  return `${header}.${payload}.${Buffer.alloc(64).toString("base64url")}`;
+}
+
+function unsafeUserIDToken(): string {
+  const header = Buffer.from(JSON.stringify({ alg: "ES256", typ: "jwt" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({ sub: "user:42", identifier: "42", type: "user", namespace: "stack-integration", aud: ["ai-sdk"], exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url");
   return `${header}.${payload}.${Buffer.alloc(64).toString("base64url")}`;
 }
 

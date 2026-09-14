@@ -70,6 +70,57 @@ fixture becomes the executable contract for future upgrades.
 | ProviderWire streaming runtime | automated | `ai-gateway/providerwire/v4` tests cover single-owner setup transfer and cleanup, standard cancellation and timeout behavior, request-scoped part counting, warning privacy/cardinality, canonical metadata, text lifecycle, ordered non-terminal provider errors, authoritative finish, standard JSON complete-frame bounds, writer/flush failures, bounded drain, and clean EOF. Golden replay exercises production `DoStream` directly, while the AGPL registered-client integration exercises it through the pinned client. | Runtime support is intentionally text-only; reasoning, tools, approvals, files, sources, custom content, raw output, and later stream families remain gaps. Fixed-prose streaming warning normalization is an intentional privacy deviation from upstream warning-string passthrough. The stream-event schema is test-only; the production encoder, fixed terminal frames, and raw HTTP assertions are server authority. |
 | Authenticated Grafana Gateway service composition | automated | `ai-gateway/cmd/grafana-ai-gateway` focused tests cover authenticated discovery, bounded transports, identity separation, exact routing, lifecycle, telemetry, and real-listener flushing. `ai-gateway/test/providerwire-v4/gateway-command.test.ts` builds and spawns the real command and uses `@ai-sdk/gateway@4.0.52` for discovery, canonical/alias unary calls, normal streaming, client abort, and process shutdown. | This is a Grafana host composition over the registered public Gateway client, not a compatibility claim for Vercel's private Gateway service. Raw discovery closure/privacy assertions remain authoritative because the pinned client parser is permissive. Unauthenticated `GET /metrics` is an intentional work-package-5 operational route with no upstream protocol equivalent. Fake Anthropic/JWKS servers establish deterministic service, cancellation, and transport evidence only; they are not provider conformance provenance and no recorded/upstream provider input is changed. Work package 5 bounds each inbound connection/request but defers aggregate connection/request budgets and health-route capacity strategy to work package 6. |
 
+### Grafana Go Gateway Client
+
+`providers/grafana` is an Apache-licensed, independently buildable client for
+the text-only WP5 service, not a second Gateway implementation. Its focused Go
+tests cover explicit request projection, atomic discovery, authentication,
+closed public errors, bounded unary/SSE parsing, and cancellation ownership.
+The existing exact-pinned ProviderWire workspace runs a test-only Go capture
+process against the same HTTP cases as `@ai-sdk/gateway@4.0.52`; real-command
+tests additionally exercise discovery, canonical/alias generation, streaming,
+static/cloud authentication, acting-user propagation, and abort.
+
+The following differences are explicit rather than claims of complete parity:
+
+- Parity-preserving Go adaptations: byte slices become base64; URLs become JSON
+  strings; timestamps become `time.Time`; local request bodies are serialized
+  JSON rather than JavaScript objects; empty warning slices can disappear only
+  when the capture process reserializes Go structs with `omitempty`.
+- Representation gaps: zero-value reasoning is omitted. Go optional strings
+  and booleans cannot distinguish absence from explicit empty/false values,
+  including `IncludeRawChunks`, `ProviderExecuted`, and optional tool names,
+  descriptions, and reasons. Required selected empty values are retained.
+- Intentional security boundaries: client-owned authentication/protocol headers
+  cannot be overridden through case variants; URL prefixes are retained;
+  discovery is atomic and bounded; response families are closed to WP5 text.
+  Upstream's permissive output schema and wildcard supported URLs are not
+  adopted. Raw unary response text is retained only within its configured bound.
+  Token-exchange errors discard arbitrary token-service response prose, including
+  through their error cause; caller cancellation retains its context identity.
+  Output-only approval requests and Go-only fields outside the pinned input
+  unions fail locally. Provider options preserve opaque object contents but
+  reject nonobject provider entries; reasoning files retain only data/URL arms.
+- Intentional error adaptation: categories/status/retryability match the closed
+  registered matrix, but Go retains public envelope prose without upstream's
+  authentication guidance or `generationId` message suffix. Generation IDs and
+  additional envelope members are not promoted into the public error API.
+- Public SSE warning/error prose remains bounded passthrough; the server owns
+  its fixed-prose privacy policy. Unknown metadata is ignored. SSE framing
+  supports LF, CRLF, bare CR, BOM, and ignored event/id fields; complete-event
+  limits count CRLF-normalized bytes while the total limit counts wire bytes.
+- Coverage gaps: differential tests reuse the comprehensive pinned request
+  golden and selected request cases, normal/ordered-error SSE behavior, and all
+  11 registered HTTP errors, not every union
+  permutation or cancellation schedule. Real-command tests exercise selected
+  public error statuses, not all 11. Hostile limits and cancellation races are
+  focused Go evidence, not provider-provenance fixtures. The baseline validator
+  does not yet automatically tie every future contract change to the client;
+  compile-time/reflection request-field witnesses and provider-shape checks are
+  the current drift guards.
+
+No provider recordings or provenance fixtures were fabricated or regenerated.
+
 ### Provider Implementation Layer
 
 | Capability | Status | Confidence Source | Gap / Notes |
