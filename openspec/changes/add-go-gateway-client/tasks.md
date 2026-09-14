@@ -15,8 +15,8 @@
 
 ## 3. Explicit ProviderWire request mapping
 
-- [ ] 3.1 Add private client request DTOs plus an exhaustive compile-time witness covering every current `provider.CallOptions` field and registered finite discriminator.
-  - Implemented: compile-time field witness, complete reachable-type/constant AST inventory, finite-arm classification tests, and mutation-proven baseline failures. Literal compiler-only discriminator-growth detection remains unavailable for Go's open string enums; see `PARITY.md` for the executable guard and exact distinction.
+- [x] 3.1 Add private client request DTOs, a compile-time witness covering every current `provider.CallOptions` field, and an exhaustive executable growth witness covering every registered finite discriminator.
+  - Go string enums are open, so discriminator growth is guarded by the complete reachable-type/constant AST inventory, finite-arm classification tests, and mutation-proven baseline failures; see `PARITY.md` for the exact Go adaptation.
 - [x] 3.2 Implement explicit prompt/content/tool/result/approval, response-format, reasoning, provider-option, call-header, scalar, URL, and selected binary-data projection with representable nil/zero/false/empty/null semantics and base64 conversion.
 - [x] 3.3 Reject invalid UTF-8, non-finite numerics, invalid raw JSON, unknown discriminators, conflicting selected arms, and unrepresentable values before token acquisition or HTTP.
 - [x] 3.4 Complete request differential goldens and classify the reasoning-default presence gap in `test/conformance/PARITY.md`; make baseline validation fail on unmapped provider-contract changes.
@@ -45,8 +45,8 @@
 
 ## 7. Authenticated service integration and documentation
 
-- [ ] 7.1 Extend repository black-box integration to build/spawn the WP5 command and exercise Go discovery, canonical/alias unary text, streaming text, cloud/static auth paths where deterministic, acting-user propagation, abort/cancellation, and all registered public errors over HTTP.
-  - All listed behavior and 10 of 11 status rows are covered. The command has no production permission policy yielding 403; that row remains covered by generic runtime/client HTTP differential tests, without a test-only command path.
+- [x] 7.1 Extend repository black-box integration to build/spawn the WP5 command and exercise Go discovery, canonical/alias unary text, streaming text, cloud/static auth paths where deterministic, acting-user propagation, abort/cancellation, and every public error reachable through the production command over HTTP; cover other registered client errors at the generic runtime/client boundary.
+  - The command covers all ten reachable status rows. Its production composition has no permission policy yielding 403, so forbidden remains covered by generic runtime/client HTTP differential tests without a test-only command path.
 - [x] 7.2 Compare equivalent Go and Vercel calls in one matrix for method/path/headers/body, unary replacement, stream normalization, error category/retryability, discovery, cancellation, `[DONE]`, raw filtering, timestamp conversion, and EOF; record every runtime-only representation difference.
 - [x] 7.3 Add credential/backend/topology privacy assertions across returned errors/results, logs captured by black-box tests, discovery, request metadata, response metadata, and stream parts.
 - [x] 7.4 Document Go client setup, both auth modes, API-prefix base URL, model discovery/registry use, text capability boundary, caller-owned cancellation/retry behavior, limits, and the separation from server-side fallback and deployment.

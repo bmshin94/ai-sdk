@@ -54,7 +54,7 @@ Alternatives rejected: treating call headers as outer-only changes body presence
 
 Use private client-side wire DTOs and explicit conversion from `provider.CallOptions`. The serializer preserves nil/absent versus explicit zero/false/empty collection where the Go type can express it, encodes selected binary data as base64, URLs as strings, opaque provider JSON without recursive interpretation, and carries call headers both in body and outer composition. It omits no field merely because WP5 cannot execute it. Invalid provider-domain discriminators, conflicting selected arms, non-finite values, invalid UTF-8, invalid JSON payloads, and values that cannot be represented in registered ProviderWire fail locally before authentication or HTTP.
 
-The known parity-preserving Go adaptation remains explicit: zero-valued `ReasoningProviderDefault` serializes as omission because `provider.CallOptions` cannot distinguish it from absent; non-zero reasoning values use registered strings. Additions to `provider.CallOptions` fail a compile-time/exhaustive client mapping witness until classified. This avoids silently inheriting behavior from generic `json.Marshal` while letting the server retain capability gating.
+The known parity-preserving Go adaptation remains explicit: zero-valued `ReasoningProviderDefault` serializes as omission because `provider.CallOptions` cannot distinguish it from absent; non-zero reasoning values use registered strings. Additions to `provider.CallOptions` fail a compile-time field witness, while additions or changes to Go's open finite string constants fail an executable, mutation-tested AST inventory until classified. This avoids silently inheriting behavior from generic `json.Marshal` while letting the server retain capability gating.
 
 Alternatives rejected: marshaling `provider.CallOptions` directly can silently drift on Go tags or future fields; importing server request types crosses the license boundary; rejecting all post-text request families in the client would make the client a second rollout authority and needlessly diverge from Vercel emission.
 
@@ -100,7 +100,7 @@ Alternatives rejected: server-validator round trips alone can let client and ser
 
 ## Risks / Trade-offs
 
-- **Explicit mapping is substantial and must evolve with the provider contract** → add an exhaustive compile-time mapping witness and classify every baseline difference in `PARITY.md`; later capability PRs extend closed output families.
+- **Explicit mapping is substantial and must evolve with the provider contract** → add a compile-time `CallOptions` field witness, an exhaustive executable finite-discriminator growth guard, and classify every baseline difference in `PARITY.md`; later capability PRs extend closed output families.
 - **The client can encode requests the text-only server rejects** → preserve exact request semantics and surface the server's typed invalid-request response; document current executable capability separately from transport representation.
 - **Restored authlib increases the client module graph** → isolate it in the separate module and prove root builds with `GOWORK=off` and the client/Gateway directories absent.
 - **A malicious endpoint can stream forever or send pathological framing** → enforce total bytes, event bytes, event count, HTTP-client/context timeouts, incremental parsing, and cancellation-aware sends; do not invent a client wall-clock deadline that overrides caller context.
