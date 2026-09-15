@@ -1,7 +1,9 @@
 # grafana-gateway-client Specification
 
 ## Purpose
-TBD - created by archiving change add-go-gateway-client. Update Purpose after archive.
+
+Define the single Apache-licensed Go client for authenticated, bounded, strict ProviderWire V4 discovery and text calls through Grafana AI Gateway.
+
 ## Requirements
 ### Requirement: Single Apache-licensed public Gateway client
 The repository SHALL expose `github.com/grafana/ai-sdk/providers/grafana` as a separate Apache-2.0 Go module. It SHALL be the only public Go ProviderWire client, SHALL implement `registry.Provider` and return `provider.LanguageModel` values, and MUST NOT import or require `github.com/grafana/ai-sdk/ai-gateway`. Request codecs, response codecs, error decoders, and SSE readers SHALL remain private implementation details; no legacy wire codec or compatibility mode SHALL be restored.
@@ -214,4 +216,3 @@ Automated tests SHALL compare equivalent Go and registered `@ai-sdk/gateway@4.0.
 #### Scenario: Authenticated command is exercised
 - **WHEN** the repository integration suite starts the WP5 command with deterministic auth and provider fakes
 - **THEN** the Go client SHALL complete discovery, unary text, streaming text, acting-user propagation, cancellation, and registered errors without exposing configured credentials or private backend identity
-

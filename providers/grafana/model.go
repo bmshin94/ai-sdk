@@ -9,6 +9,7 @@ import (
 	"mime"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/grafana/ai-sdk/provider"
 )
@@ -87,8 +88,10 @@ func (m *model) DoStream(ctx context.Context, opts provider.CallOptions) (*provi
 
 func responseHeaders(headers http.Header) map[string]string {
 	result := make(map[string]string, len(headers))
-	for name := range headers {
-		result[name] = headers.Get(name)
+	for name, values := range headers {
+		if len(values) > 0 {
+			result[name] = strings.Join(values, ", ")
+		}
 	}
 	return result
 }

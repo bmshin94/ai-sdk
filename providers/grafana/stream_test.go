@@ -53,7 +53,7 @@ func streamFromBody(t *testing.T, body io.ReadCloser, limits *Limits) provider.L
 		assert.Equal(t, "true", req.Header.Get("Ai-Language-Model-Streaming"))
 		assert.Equal(t, "text/event-stream", req.Header.Get("Accept"))
 		assert.Equal(t, "application/json", req.Header.Get("Content-Type"))
-		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream; charset=utf-8"}, "X-Server": {"stream"}}, Body: body, Request: req}, nil
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream; charset=utf-8"}, "X-Server": {"stream"}, "X-Multi": {"one", "two"}}, Body: body, Request: req}, nil
 	})}})
 	require.NoError(t, err)
 	m, err := p.LanguageModel("assistant")
@@ -87,6 +87,7 @@ func TestModel_StreamNormalization(t *testing.T) {
 			require.NotNil(t, result.Request)
 			assert.JSONEq(t, `[]`, jsonMember(t, result.Request.Body, "prompt"))
 			assert.Equal(t, "stream", result.Response.Headers["X-Server"])
+			assert.Equal(t, "one, two", result.Response.Headers["X-Multi"])
 			parts := collectParts(t, result)
 			want := 8
 			if includeRaw {
