@@ -1723,11 +1723,17 @@ func convertInlineToolSearchResult(p provider.ContentPart, cc anthropic.BetaCach
 		return nil
 	}
 
-	var toolRefs []anthropic.BetaToolReferenceBlockParam
-	for _, ref := range refs {
-		toolRefs = append(toolRefs, anthropic.BetaToolReferenceBlockParam{
+	// Allocate eagerly so a successful zero-match search serializes
+	// "tool_references": [] instead of omitting the field. The param is tagged
+	// omitzero, which drops a nil slice but keeps an empty non-nil one, and the
+	// API requires the array on a successful result. Upstream
+	// convert-to-anthropic-prompt.ts maps unconditionally, so an empty result
+	// always carries the array there too.
+	toolRefs := make([]anthropic.BetaToolReferenceBlockParam, len(refs))
+	for i, ref := range refs {
+		toolRefs[i] = anthropic.BetaToolReferenceBlockParam{
 			ToolName: ref.ToolName,
-		})
+		}
 	}
 
 	block := anthropic.BetaContentBlockParamUnion{

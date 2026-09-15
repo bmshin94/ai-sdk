@@ -4164,6 +4164,50 @@ func TestConvertAssistantContent_InlineToolResults(t *testing.T) {
 		assert.Equal(t, "srv-3", blocks[0].OfToolSearchToolResult.ToolUseID)
 	})
 
+	t.Run("tool_search result serializes tool_references", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			output   string
+			expected string
+		}{
+			{
+				name:     "zero matches",
+				output:   `[]`,
+				expected: `{"type":"tool_search_tool_search_result","tool_references":[]}`,
+			},
+			{
+				name:     "one match",
+				output:   `[{"toolName":"my_func"}]`,
+				expected: `{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"my_func"}]}`,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				parts := []provider.ContentPart{
+					provider.ContentPart{Type: provider.ContentPartTypeToolResult,
+						ToolCallID: "srv-4",
+						ToolName:   "tool_search_tool_bm25",
+						Output: &provider.ToolResultOutput{
+							Type: provider.ToolOutputJSON,
+							JSON: json.RawMessage(tc.output),
+						},
+					},
+				}
+				warnings = nil
+				blocks := convertAssistantContent(v, mapping, parts, nil, mcpIDs, &warnings)
+				require.Len(t, blocks, 1)
+				require.NotNil(t, blocks[0].OfToolSearchToolResult)
+				assert.Empty(t, warnings)
+
+				// Assert the serialized content, not just the Go slice: a
+				// successful result must carry tool_references on the wire, and
+				// the API rejects the block when the field is absent.
+				serialized, err := json.Marshal(blocks[0].OfToolSearchToolResult.Content)
+				require.NoError(t, err)
+				assert.JSONEq(t, tc.expected, string(serialized))
+			})
+		}
+	})
+
 	t.Run("web_fetch result emits web_fetch_tool_result", func(t *testing.T) {
 		parts := []provider.ContentPart{
 			provider.ContentPart{Type: provider.ContentPartTypeToolResult,
