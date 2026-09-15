@@ -20,7 +20,7 @@ The authenticated Gateway created by work package 5 is usable from the registere
 
 ### Modified Capabilities
 
-None.
+- `provider-wire`: preserve retirement of the tolerant unversioned server and client behavior while allowing the independently implemented strict ProviderWire V4 client at `providers/grafana`.
 
 ## Impact
 
