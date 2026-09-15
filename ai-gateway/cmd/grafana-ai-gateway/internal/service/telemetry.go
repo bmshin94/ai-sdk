@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,6 +19,8 @@ import (
 type telemetryStateKey struct{}
 
 type telemetryState struct {
+	authMu      sync.Mutex
+	authSource  string
 	authOutcome atomic.Uint32
 	observation atomic.Pointer[requestObservation]
 }
@@ -36,6 +39,7 @@ type Telemetry struct {
 	inFlight              *prometheus.GaugeVec
 	requests              *prometheus.CounterVec
 	duration              *prometheus.HistogramVec
+	authentication        *prometheus.CounterVec
 	agentExportFailures   *prometheus.CounterVec
 	staticObservation     requestObservation
 	generateCorrelationID func() string
@@ -79,6 +83,11 @@ func newTelemetry(logger *slog.Logger, registry *prometheus.Registry, options ..
 			Name:      "http_request_duration_seconds",
 			Help:      "HTTP request duration in seconds.",
 		}, []string{"route", "method", "status"}),
+		authentication: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "grafana_ai_gateway",
+			Name:      "authentication_total",
+			Help:      "Authentication attempts by source and outcome.",
+		}, []string{"source", "outcome"}),
 		agentExportFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "grafana_ai_gateway",
 			Name:      "agento11y_export_failures_total",
@@ -92,6 +101,7 @@ func newTelemetry(logger *slog.Logger, registry *prometheus.Registry, options ..
 		telemetry.inFlight,
 		telemetry.requests,
 		telemetry.duration,
+		telemetry.authentication,
 		telemetry.agentExportFailures,
 	} {
 		if err := registry.Register(collector); err != nil {
@@ -145,9 +155,15 @@ func (telemetry *Telemetry) SetReady(ready bool) {
 
 // ObserveAuthentication records the closed outcome and normalized caller without retaining token-bearing authlib state.
 func (telemetry *Telemetry) ObserveAuthentication(ctx context.Context, observation gatewayauth.Observation) {
+	source := authenticationSourceClass(observation.Source)
+	outcome := authenticationClass(observation.Outcome)
+	telemetry.authentication.WithLabelValues(source, outcome).Inc()
 	if state, ok := ctx.Value(telemetryStateKey{}).(*telemetryState); ok {
+		state.authMu.Lock()
+		state.authSource = source
+		state.authMu.Unlock()
 		state.authOutcome.Store(uint32(observation.Outcome))
-		if observation.Outcome == gatewayauth.OutcomeAuthenticated && observation.Caller != nil {
+		if observation.Outcome == gatewayauth.OutcomeAuthenticated && observation.Source != gatewayauth.SourceCloudGateway && observation.Caller != nil {
 			current := observationFromContext(ctx)
 			current.callerService = boundedObservationValue(observation.Caller.Service)
 			current.namespace = boundedObservationValue(observation.Caller.Namespace)
@@ -163,7 +179,7 @@ func (telemetry *Telemetry) Middleware(next http.Handler) http.Handler {
 		method := normalizeMethod(request.Method)
 		observation := telemetry.staticObservation
 		observation.correlationID = boundedObservationValue(telemetry.generateCorrelationID())
-		state := &telemetryState{}
+		state := &telemetryState{authSource: authenticationSourceClass("")}
 		state.observation.Store(&observation)
 		request = request.WithContext(context.WithValue(request.Context(), telemetryStateKey{}, state))
 		wrapped := &responseWriter{ResponseWriter: w}
@@ -179,11 +195,15 @@ func (telemetry *Telemetry) Middleware(next http.Handler) http.Handler {
 			duration := time.Since(started).Seconds()
 			telemetry.requests.WithLabelValues(route, method, statusClass).Inc()
 			telemetry.duration.WithLabelValues(route, method, statusClass).Observe(duration)
+			state.authMu.Lock()
+			source := state.authSource
+			state.authMu.Unlock()
 			attrs := []any{
 				"route", route,
 				"method", method,
 				"status", statusClass,
 				"authentication", authenticationClass(gatewayauth.Outcome(state.authOutcome.Load())),
+				"authentication_source", source,
 			}
 			for _, attr := range observationLogAttrs(request.Context()) {
 				attrs = append(attrs, attr)
@@ -216,6 +236,17 @@ func (writer *responseWriter) Write(value []byte) (int, error) {
 
 func (writer *responseWriter) Unwrap() http.ResponseWriter {
 	return writer.ResponseWriter
+}
+
+func authenticationSourceClass(source gatewayauth.Source) string {
+	switch source {
+	case gatewayauth.SourceAccessToken:
+		return "access-token"
+	case gatewayauth.SourceCloudGateway:
+		return "cloud-gateway"
+	default:
+		return "unknown"
+	}
 }
 
 func authenticationClass(outcome gatewayauth.Outcome) string {

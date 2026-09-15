@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -552,6 +552,431 @@ describe("authenticated Anthropic Gateway command", () => {
   });
 });
 
+describe("Trusted-proxy composition (dummy credentials, not production authentication)", () => {
+  it("uses only the edge stack assertion for read discovery and write unary/stream, never forwarding customer credentials to Anthropic", async () => {
+    const [fake, gateway, edge] = await startCloudGateway();
+    const spoofed = {
+      "X-Scope-OrgID": "client-invalid-stack",
+      "X-Cloud-Org-ID": "client-invalid-organization",
+      "X-Access-Policy-ID": "client invalid policy",
+      "X-Access-Token": TEST_TOKEN,
+      "X-Grafana-Id": "customer-internal-id-token",
+      "x-api-key": "customer-provider-key",
+    };
+    try {
+      const direct = await rawHTTPRequest(`${gateway.url}/api/v1/aisdk/config`, "GET",
+        Object.entries(spoofed).filter(([name]) => !["X-Access-Token", "X-Grafana-Id"].includes(name)));
+      assertAppAuthenticationFailure(direct);
+      const metadata = await edge.client(EDGE_READ_KEY, spoofed).getAvailableModels();
+      assert.deepEqual(metadata.models.map((model) => model.id), ["assistant", "grafana/assistant"]);
+      const client = edge.client(EDGE_WRITE_KEY, spoofed);
+      const unary = await client("assistant").doGenerate(cloudCall("unary"));
+      assert.deepEqual(unary.content, [{ type: "text", text: "hello from fake Anthropic" }]);
+      const stream = await client("grafana/assistant").doStream(cloudCall("normal-stream"));
+      const parts = await withTimeout(collectStream(stream.stream), 5_000, "Cloud stream EOF");
+      assert.equal(parts[0]?.type, "stream-start");
+      assert.equal(parts.at(-1)?.type, "finish");
+      assert.equal(parts.filter((part) => part.type === "text-delta").map((part) => part.delta).join(""),
+        "hello from fake Anthropic stream");
+      assert.equal(edge.forwarded.length, 3);
+      assert.deepEqual(edge.forwarded.map((request) => request.path), [
+        "/api/v1/aisdk/config", "/api/v1/aisdk/language-model", "/api/v1/aisdk/language-model",
+      ]);
+      for (const request of edge.forwarded) {
+        for (const [name, value] of EDGE_ASSERTIONS) {
+          assert.deepEqual(request.headers.filter(([key]) => key.toLowerCase() === name.toLowerCase()), [[name, value]]);
+        }
+        assert.ok(!request.headers.some(([name]) => PROHIBITED_HEADERS.includes(name.toLowerCase())));
+        for (const name of ["x-cloud-org-id", "x-access-policy-id", "x-api-key"]) {
+          assert.ok(!request.headers.some(([key]) => key.toLowerCase() === name));
+        }
+      }
+      assert.equal(edge.received[0]?.headers.authorization, `Bearer ${EDGE_READ_KEY}`);
+      assert.equal(edge.received[1]?.headers.authorization, `Bearer ${EDGE_WRITE_KEY}`);
+      assert.equal(edge.received[1]?.headers["x-access-token"], TEST_TOKEN);
+      assert.equal(edge.received[1]?.headers["x-api-key"], spoofed["x-api-key"]);
+      assert.equal(fake.requests.length, 2);
+      for (const request of fake.requests) {
+        assert.equal(request.apiKey, "integration-anthropic-key");
+        assert.equal(request.body.max_tokens, 32);
+        for (const name of [...PROHIBITED_HEADERS, ...EDGE_ASSERTIONS.map(([name]) => name.toLowerCase()), "x-cloud-org-id", "x-access-policy-id"]) {
+          assert.equal(request.headers[name], undefined);
+        }
+        assertCloudPrivateValuesAbsent(JSON.stringify({ headers: request.headers, body: request.body }), [
+          ...CLOUD_PRIVATE_VALUES, ...Object.values(spoofed),
+        ]);
+      }
+      assert.deepEqual(fake.violations, []);
+      const ignoredHeadersDiscovery = await rawHTTPRequest(`${gateway.url}/api/v1/aisdk/config`, "GET", [
+        ...EDGE_ASSERTIONS,
+        ["X-Cloud-Org-ID", spoofed["X-Cloud-Org-ID"]],
+        ["X-Access-Policy-ID", spoofed["X-Access-Policy-ID"]],
+      ]);
+      assert.equal(ignoredHeadersDiscovery.status, 200);
+      assert.equal(fake.requests.length, 2);
+      const metrics = await gateway.metrics();
+      assert.equal(authenticationCount(metrics, "authenticated"), 4);
+      assert.equal(authenticationCount(metrics, "authentication_failed"), 1);
+      await gateway.stop();
+      assertCloudPrivateValuesAbsent([direct.body, ignoredHeadersDiscovery.body, metrics, gateway.stderr].join("\n"), [
+        ...CLOUD_PRIVATE_VALUES, ...Object.values(spoofed), fake.url, "backend-private", "integration-anthropic-key",
+      ]);
+    } finally {
+      await settleCleanup(() => edge.stop(), () => gateway.stop(), () => fake.stop());
+    }
+  });
+
+  it("denies read-only inference, write-only discovery, and invalid keys at the shim without app or provider calls", async () => {
+    const [fake, gateway, edge] = await startCloudGateway();
+    try {
+      const before = protectedMetrics(await gateway.metrics());
+      for (const [key, operation] of [
+        [EDGE_READ_KEY, "unary"], [EDGE_READ_KEY, "stream"], [EDGE_WRITE_KEY, "discovery"],
+        [EDGE_INVALID_KEY, "discovery"], [EDGE_INVALID_KEY, "unary"], [EDGE_INVALID_KEY, "stream"],
+      ] as const) {
+        const client = edge.client(key);
+        await assert.rejects(withTimeout(
+          Promise.resolve<unknown>(operation === "discovery" ? client.getAvailableModels()
+            : operation === "unary" ? client("assistant").doGenerate(cloudCall("unary"))
+              : client("assistant").doStream(cloudCall("normal-stream"))),
+          5_000, "edge denial",
+        ), (error: unknown) => {
+          assert.equal((error as { statusCode?: number }).statusCode, key === EDGE_INVALID_KEY ? 401 : 403);
+          return true;
+        });
+        assert.equal(edge.forwarded.length, 0);
+        assert.equal(fake.requests.length, 0);
+        assert.deepEqual(protectedMetrics(await gateway.metrics()), before);
+      }
+      assert.equal(edge.denied, 6);
+      assert.equal(edge.received.length, 6);
+    } finally {
+      await settleCleanup(() => edge.stop(), () => gateway.stop(), () => fake.stop());
+    }
+  });
+
+  it("rejects controlled post-replacement malformed assertions and surviving credentials with the exact app error", async () => {
+    const [fake, gateway, edge] = await startCloudGateway();
+    try {
+      const cases: Array<{ name: string; mutate: HeaderMutation }> = [];
+      for (const [name, value] of EDGE_ASSERTIONS) {
+        const coalesced = new Headers();
+        coalesced.append(name, value);
+        coalesced.append(name.toLowerCase(), value);
+        assert.equal(coalesced.get(name), `${value}, ${value}`);
+        for (const [kind, replacement] of [
+          ["missing", []], ["empty", [[name, ""]]],
+          ["actual duplicate lines", [[name, value], [name, value]]],
+          ["actual case-colliding lines", [[name, value], [name.toLowerCase(), value]]],
+          ["fetch Headers comma-coalesced value (not duplicate lines)", [[name, coalesced.get(name)!]]],
+        ] as Array<[string, HeaderPairs]>) {
+          cases.push({ name: `${name}: ${kind}`, mutate: (headers) => replaceHeader(headers, name, replacement) });
+        }
+      }
+      for (const value of ["0", "-1", "+1", "1.5", "1e3", "9223372036854775808", "invalid-private-number"]) {
+        cases.push({ name: `X-Scope-OrgID: ${value}`, mutate: (headers) => replaceHeader(headers, "X-Scope-OrgID", [["X-Scope-OrgID", value]]) });
+      }
+      for (const [name, value] of [["Authorization", `Bearer ${EDGE_WRITE_KEY}`], ["X-Access-Token", TEST_TOKEN], ["X-Grafana-Id", "surviving-private-id"]]) {
+        for (const credential of [value!, ""]) {
+          cases.push({ name: `surviving ${name}`, mutate: (headers) => [...headers, [name!, credential]] });
+        }
+      }
+      let rejected = 0;
+      for (const testCase of cases) {
+        edge.mutate = testCase.mutate;
+        for (const operation of ["discovery", "unary", "stream"] as const) {
+          const response = await edgeRawRequest(edge, operation);
+          assertAppAuthenticationFailure(response, testCase.name);
+          rejected++;
+          assert.equal(edge.forwarded.length, rejected);
+          assert.equal(fake.requests.length, 0, testCase.name);
+        }
+      }
+      const metrics = await gateway.metrics();
+      assert.equal(authenticationCount(metrics, "authentication_failed"), rejected);
+      assert.equal(authenticationCount(metrics, "authenticated"), 0);
+      const authLines = metrics.split("\n").filter((line) => line.startsWith("grafana_ai_gateway_authentication_total{"));
+      assert.deepEqual(authLines, [`grafana_ai_gateway_authentication_total{outcome="authentication_failed",source="cloud-gateway"} ${rejected}`]);
+      await gateway.stop();
+      assert.equal(edge.appErrors.length, rejected);
+      assert.ok(edge.appErrors.every((body) => body === APP_AUTHENTICATION_JSON));
+      assertCloudPrivateValuesAbsent([metrics, gateway.stderr, ...edge.appErrors].join("\n"), [
+        ...CLOUD_PRIVATE_VALUES, "surviving-private-id", "invalid-private-number",
+      ]);
+      const completions = gateway.stderr.split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((record) => record.msg === "http request completed" && ["config", "language_model"].includes(String(record.route)));
+      assert.equal(completions.length, rejected);
+      assert.ok(completions.every((record) => record.authentication_source === "cloud-gateway" && record.authentication === "authentication_failed"));
+    } finally {
+      await settleCleanup(() => edge.stop(), () => gateway.stop(), () => fake.stop());
+    }
+  });
+
+  it("starts without JWKS, separates operational routes, flushes, cancels, and exits both listeners on SIGTERM", async () => {
+    const [fake, gateway, edge] = await startCloudGateway([
+      "--auth.jwks-timeout=0s", "--auth.jwks-response-bytes=0", "--auth.jwks-max-keys=0", "--auth.audiences=",
+    ]);
+    try {
+      assert.notEqual(gateway.url, gateway.operationalURL);
+      assert.equal(fake.requests.length, 0);
+      for (const path of ["/live", "/ready", "/metrics"]) {
+        assert.equal((await rawHTTPRequest(`${gateway.operationalURL}${path}`, "GET", [])).status, 200);
+        assert.equal((await rawHTTPRequest(`${gateway.url}${path}`, "GET", EDGE_ASSERTIONS)).status, 404);
+      }
+      for (const [path, method] of [["/api/v1/aisdk/config", "GET"], ["/api/v1/aisdk/language-model", "POST"]]) {
+        assert.equal((await rawHTTPRequest(`${gateway.operationalURL}${path}`, method!, EDGE_ASSERTIONS)).status, 404);
+      }
+      for (const marker of ["silent-abort", "silent-shutdown"]) {
+        const result = await withTimeout(Promise.resolve(edge.client(EDGE_WRITE_KEY)("assistant").doStream({
+          ...cloudCall(marker), abortSignal: AbortSignal.timeout(15_000),
+        })), 2_000, "Cloud stream setup");
+        const reader = result.stream.getReader();
+        const first = await withTimeout(reader.read(), 2_000, "Cloud stream-start must flush before provider EOF");
+        assert.equal(first.done, false);
+        assert.equal(first.value?.type, "stream-start");
+        if (marker === "silent-abort") {
+          await reader.cancel("Cloud client abort");
+          await fake.waitForCancellation(marker);
+          assert.equal(await gateway.ready(), true);
+        } else {
+          const stopped = gateway.stop("SIGTERM");
+          await fake.waitForCancellation(marker);
+          await stopped;
+          await reader.cancel().catch(() => {});
+        }
+      }
+      assert.equal(await gateway.ready(), false);
+      for (const url of [gateway.url, gateway.operationalURL]) {
+        await assert.rejects(fetch(`${url}/ready`, { signal: AbortSignal.timeout(500) }));
+      }
+      assert.deepEqual(processLifecycleEvents(gateway.stderr), [
+        "process_starting", "process_ready", "process_shutdown_started", "process_shutdown_completed",
+      ]);
+      assert.deepEqual(fake.violations, []);
+      assertCloudPrivateValuesAbsent(gateway.stderr, CLOUD_PRIVATE_VALUES);
+    } finally {
+      await settleCleanup(() => edge.stop(), () => gateway.stop(), () => fake.stop());
+    }
+  });
+
+  it("fails invalid Cloud startup combinations before readiness and cleans up without configuration leaks", async () => {
+    const fake = await FakeAnthropic.start();
+    try {
+      const samePort = await availablePort();
+      for (const args of [
+        ["--auth.mode=invalid-private-mode"],
+        ["--auth.unsafe"],
+        [`--auth.jwks-url=${fake.url}/private-jwks`],
+        ["--server.operational-listen-address="],
+        ["--server.operational-listen-address=private-invalid-address"],
+        [`--server.listen-address=127.0.0.1:${samePort}`, `--server.operational-listen-address=127.0.0.1:${samePort}`],
+      ]) {
+        let unexpected: GatewayProcess | undefined;
+        try {
+          await assert.rejects(async () => {
+            unexpected = await GatewayProcess.start(binaryPath, fake.url, args, {}, "cloud-gateway");
+          }, (error: unknown) => {
+            const failure = String(error);
+            assert.match(failure, /gateway exited unsuccessfully/);
+            assert.deepEqual(processLifecycleEvents(failure), ["process_starting"]);
+            assertCloudPrivateValuesAbsent(failure, [...CLOUD_PRIVATE_VALUES, fake.url, "private-jwks", "private-invalid-address", "invalid-private-mode"]);
+            return true;
+          });
+        } finally {
+          await unexpected?.stop();
+        }
+        assert.ok(GatewayProcess.lastFailedDirectory);
+        assert.equal(existsSync(GatewayProcess.lastFailedDirectory), false);
+        assert.equal(fake.requests.length, 0);
+      }
+    } finally {
+      await fake.stop();
+    }
+  });
+});
+
+const EDGE_READ_KEY = "dummy-read-key";
+const EDGE_WRITE_KEY = "dummy-write-key";
+const EDGE_INVALID_KEY = "dummy-invalid-key";
+const EDGE_ASSERTIONS: HeaderPairs = [
+  ["X-Scope-OrgID", "17319428876500123"],
+];
+const PROHIBITED_HEADERS = ["authorization", "x-access-token", "x-grafana-id"];
+const CLOUD_PRIVATE_VALUES = [EDGE_READ_KEY, EDGE_WRITE_KEY, EDGE_INVALID_KEY, TEST_TOKEN, ...EDGE_ASSERTIONS.map(([, value]) => value)];
+const APP_AUTHENTICATION_JSON = '{"error":{"message":"authentication failed","type":"authentication_error","param":null,"code":"authentication_error"}}';
+type HeaderPairs = Array<[string, string]>;
+type HeaderMutation = (headers: HeaderPairs) => HeaderPairs;
+type RawResponse = { status: number; body: string; headers: IncomingMessage["headers"] };
+
+function cloudCall(text: string) {
+  return {
+    prompt: [{ role: "user" as const, content: [{ type: "text" as const, text }] }],
+    maxOutputTokens: 32,
+    abortSignal: AbortSignal.timeout(5_000),
+  };
+}
+
+async function collectStream(stream: ReadableStream<{ type: string; delta?: string }>) {
+  const reader = stream.getReader();
+  const parts: Array<{ type: string; delta?: string }> = [];
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) return parts;
+      parts.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function assertCloudPrivateValuesAbsent(output: string, values: readonly string[]): void {
+  for (const value of values) assert.ok(!output.includes(value), `private value leaked: ${value}`);
+}
+
+function assertAppAuthenticationFailure(response: RawResponse, message?: string): void {
+  assert.equal(response.status, 401, message);
+  assert.equal(response.headers["content-type"], "application/json", message);
+  assert.equal(response.body, APP_AUTHENTICATION_JSON, message);
+}
+
+function authenticationCount(metrics: string, outcome: string): number {
+  const prefix = `grafana_ai_gateway_authentication_total{outcome="${outcome}",source="cloud-gateway"} `;
+  const line = metrics.split("\n").find((line) => line.startsWith(prefix));
+  return line == null ? 0 : Number(line.slice(prefix.length));
+}
+
+function protectedMetrics(metrics: string): string[] {
+  return metrics.split("\n").filter((line) => line.startsWith("grafana_ai_gateway_authentication_total{") ||
+    (line.startsWith("grafana_ai_gateway_http_requests_total{") && /route="(?:config|language_model)"/.test(line)));
+}
+
+function replaceHeader(headers: HeaderPairs, name: string, replacement: HeaderPairs): HeaderPairs {
+  return [...headers.filter(([key]) => key.toLowerCase() !== name.toLowerCase()), ...replacement];
+}
+
+function rawHTTPRequest(url: string, method: string, headers: HeaderPairs, body = ""): Promise<RawResponse> {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(url, {
+      method, headers: [["Host", new URL(url).host], ["Connection", "close"], ...headers].flat(),
+      signal: AbortSignal.timeout(5_000),
+    }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.on("error", reject);
+      response.on("end", () => resolve({ status: response.statusCode!, headers: response.headers, body: Buffer.concat(chunks).toString() }));
+    });
+    request.on("error", reject);
+    request.end(body);
+  });
+}
+
+function edgeRawRequest(edge: DummyCloudEdge, operation: "discovery" | "unary" | "stream"): Promise<RawResponse> {
+  const discovery = operation === "discovery";
+  const body = discovery ? "" : JSON.stringify({
+    prompt: [{ role: "user", content: [{ type: "text", text: "unary" }] }], maxOutputTokens: 32,
+  });
+  return rawHTTPRequest(`${edge.url}/api/v1/aisdk/${discovery ? "config" : "language-model"}`, discovery ? "GET" : "POST", [
+    ["Authorization", `Bearer ${discovery ? EDGE_READ_KEY : EDGE_WRITE_KEY}`],
+    ["Content-Type", "application/json"], ["Content-Length", String(Buffer.byteLength(body))],
+    ["ai-language-model-specification-version", "4"], ["ai-language-model-id", "assistant"],
+    ["ai-language-model-streaming", String(operation === "stream")],
+  ], body);
+}
+
+async function startCloudGateway(extraArgs: string[] = []): Promise<[FakeAnthropic, GatewayProcess, DummyCloudEdge]> {
+  const fake = await FakeAnthropic.start();
+  let gateway: GatewayProcess | undefined;
+  try {
+    gateway = await GatewayProcess.start(binaryPath, fake.url, extraArgs, {}, "cloud-gateway");
+    return [fake, gateway, await DummyCloudEdge.start(gateway.url)];
+  } catch (error) {
+    await settleCleanup(() => fake.stop(), ...(gateway == null ? [] : [() => gateway!.stop()]));
+    throw error;
+  }
+}
+
+class DummyCloudEdge {
+  readonly received: Array<{ path: string; headers: IncomingMessage["headers"] }> = [];
+  readonly forwarded: Array<{ path: string; headers: HeaderPairs }> = [];
+  readonly appErrors: string[] = [];
+  denied = 0;
+  mutate: HeaderMutation = (headers) => headers;
+  private readonly pending = new Set<ReturnType<typeof httpRequest>>();
+
+  private constructor(
+    private readonly server: ReturnType<typeof createServer>,
+    readonly url: string,
+    private readonly appURL: string,
+  ) {}
+
+  static async start(appURL: string): Promise<DummyCloudEdge> {
+    let edge: DummyCloudEdge;
+    const server = createServer((request, response) => edge.handle(request, response));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address == null || typeof address === "string") throw new Error("edge did not bind TCP");
+    edge = new DummyCloudEdge(server, `http://127.0.0.1:${address.port}`, appURL);
+    return edge;
+  }
+
+  client(apiKey: string, headers: Record<string, string> = {}) {
+    return createGateway({ apiKey, headers, baseURL: `${this.url}/api/v1/aisdk` });
+  }
+
+  async stop(): Promise<void> {
+    for (const request of this.pending) request.destroy();
+    this.server.closeAllConnections();
+    await new Promise<void>((resolve) => this.server.close(() => resolve()));
+  }
+
+  private handle(request: IncomingMessage, response: ServerResponse): void {
+    const path = request.url ?? "/";
+    this.received.push({ path, headers: { ...request.headers } });
+    const authorization = request.headers.authorization;
+    const known = authorization === `Bearer ${EDGE_READ_KEY}` || authorization === `Bearer ${EDGE_WRITE_KEY}`;
+    const allowed = (authorization === `Bearer ${EDGE_READ_KEY}` && request.method === "GET" && path === "/api/v1/aisdk/config") ||
+      (authorization === `Bearer ${EDGE_WRITE_KEY}` && request.method === "POST" && path === "/api/v1/aisdk/language-model");
+    if (!allowed) {
+      this.denied++;
+      request.resume();
+      response.writeHead(known ? 403 : 401, { "Content-Type": "application/json" });
+      response.end('{"error":{"message":"dummy edge denied","type":"authentication_error"}}');
+      return;
+    }
+    const removed = [...PROHIBITED_HEADERS, ...EDGE_ASSERTIONS.map(([name]) => name.toLowerCase()), "x-cloud-org-id", "x-access-policy-id", "x-api-key", "host", "connection"];
+    const headers: HeaderPairs = [];
+    for (let i = 0; i < request.rawHeaders.length; i += 2) {
+      const name = request.rawHeaders[i]!;
+      if (!removed.includes(name.toLowerCase())) headers.push([name, request.rawHeaders[i + 1]!]);
+    }
+    const replaced = this.mutate([...headers, ...EDGE_ASSERTIONS]);
+    this.forwarded.push({ path, headers: replaced });
+    const upstream = httpRequest(this.appURL + path, {
+      method: request.method,
+      headers: [["Host", new URL(this.appURL).host], ["Connection", "close"], ...replaced].flat(),
+      signal: AbortSignal.timeout(15_000),
+    }, (appResponse) => {
+      response.writeHead(appResponse.statusCode!, appResponse.headers);
+      response.flushHeaders();
+      if (appResponse.statusCode === 401) {
+        const chunks: Buffer[] = [];
+        appResponse.on("data", (chunk: Buffer) => chunks.push(chunk));
+        appResponse.on("end", () => this.appErrors.push(Buffer.concat(chunks).toString()));
+      }
+      appResponse.on("error", () => response.destroy());
+      appResponse.pipe(response);
+    });
+    this.pending.add(upstream);
+    upstream.once("close", () => this.pending.delete(upstream));
+    upstream.on("error", () => response.destroy());
+    response.once("close", () => upstream.destroy());
+    request.once("aborted", () => upstream.destroy());
+    request.on("error", () => upstream.destroy());
+    request.pipe(upstream);
+  }
+}
+
 async function startGateway(extraArgs: string[] = [], extraEnv: Record<string, string> = {}): Promise<[FakeAnthropic, GatewayProcess]> {
   const fake = await FakeAnthropic.start();
   try {
@@ -593,14 +1018,16 @@ class GatewayProcess {
 
   readonly process: ChildProcess;
   readonly url: string;
+  readonly operationalURL: string;
   readonly directory: string;
   stderr = "";
   private stopped = false;
   private readonly exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 
-  private constructor(proc: ChildProcess, url: string, directory: string) {
+  private constructor(proc: ChildProcess, url: string, operationalURL: string, directory: string) {
     this.process = proc;
     this.url = url;
+    this.operationalURL = operationalURL;
     this.directory = directory;
     proc.stderr?.on("data", (chunk: Buffer) => { this.stderr += chunk.toString(); });
     this.exited = new Promise((resolve, reject) => {
@@ -609,7 +1036,7 @@ class GatewayProcess {
     });
   }
 
-  static async start(binary: string, anthropicURL: string, extraArgs: string[] = [], extraEnv: Record<string, string> = {}): Promise<GatewayProcess> {
+  static async start(binary: string, anthropicURL: string, extraArgs: string[] = [], extraEnv: Record<string, string> = {}, mode: "access-token" | "cloud-gateway" = "access-token"): Promise<GatewayProcess> {
     const directory = mkdtempSync(join(tmpdir(), "grafana-ai-gateway-process-"));
     this.lastFailedDirectory = undefined;
     let gateway: GatewayProcess | undefined;
@@ -618,10 +1045,18 @@ class GatewayProcess {
       writeFileSync(configPath, `providers:\n  anthropic-primary:\n    type: anthropic\n    apiKeyEnv: GATEWAY_TEST_ANTHROPIC_KEY\n    baseURL: ${anthropicURL}\nmodels:\n  grafana/assistant:\n    name: Grafana Assistant\n    description: Integration model\n    primary:\n      provider: anthropic-primary\n      model: backend-private\n    aliases:\n      - assistant\n`);
       const port = await availablePort();
       const url = `http://127.0.0.1:${port}`;
+      let operationalPort = port;
+      if (mode === "cloud-gateway") {
+        do { operationalPort = await availablePort(); } while (operationalPort === port);
+      }
+      const operationalURL = `http://127.0.0.1:${operationalPort}`;
       const args = [
         `--config.file=${configPath}`,
         "--deployment.mode=development",
-        "--auth.unsafe",
+        ...(mode === "cloud-gateway" ? [
+          "--auth.mode=cloud-gateway",
+          `--server.operational-listen-address=127.0.0.1:${operationalPort}`,
+        ] : ["--auth.unsafe"]),
         `--server.listen-address=127.0.0.1:${port}`,
         "--server.shutdown-timeout=2s",
         ...extraArgs,
@@ -629,9 +1064,13 @@ class GatewayProcess {
       const proc = spawn(binary, args, {
         cwd: directory,
         stdio: ["ignore", "ignore", "pipe"],
-        env: { ...nodeProcess.env, GATEWAY_TEST_ANTHROPIC_KEY: "integration-anthropic-key", ...extraEnv },
+        env: {
+          ...Object.fromEntries(Object.entries(nodeProcess.env).filter(([name]) => !name.startsWith("GRAFANA_AI_GATEWAY_") && !name.startsWith("AGENTO11Y_") && !name.startsWith("SIGIL_"))),
+          GATEWAY_TEST_ANTHROPIC_KEY: "integration-anthropic-key",
+          ...extraEnv,
+        },
       });
-      gateway = new GatewayProcess(proc, url, directory);
+      gateway = new GatewayProcess(proc, url, operationalURL, directory);
       const deadline = Date.now() + READY_TIMEOUT_MS;
       while (Date.now() < deadline) {
         const outcome = await Promise.race([
@@ -664,9 +1103,15 @@ class GatewayProcess {
     });
   }
 
+  async metrics(): Promise<string> {
+    const response = await fetch(`${this.operationalURL}/metrics`, { signal: AbortSignal.timeout(2_000) });
+    assert.equal(response.status, 200);
+    return response.text();
+  }
+
   async ready(): Promise<boolean> {
     try {
-      return (await fetch(`${this.url}/ready`, { signal: AbortSignal.timeout(500) })).ok;
+      return (await fetch(`${this.operationalURL}/ready`, { signal: AbortSignal.timeout(500) })).ok;
     } catch {
       return false;
     }
@@ -708,7 +1153,7 @@ class GatewayProcess {
   }
 }
 
-type FakeRequest = { path: string; apiKey?: string; body: Record<string, unknown> };
+type FakeRequest = { path: string; apiKey?: string; headers: IncomingMessage["headers"]; body: Record<string, unknown> };
 
 class FakeAnthropic {
   readonly url: string;
@@ -751,7 +1196,7 @@ class FakeAnthropic {
     const serialized = JSON.stringify(body);
     const marker = ["silent-abort", "silent-shutdown", "silent-unary-shutdown", "normal-stream", "provider-error", "redirect", "oversized"]
       .find((value) => serialized.includes(value));
-    this.requests.push({ path: request.url ?? "", apiKey: singleHeader(request.headers["x-api-key"]), body });
+    this.requests.push({ path: request.url ?? "", apiKey: singleHeader(request.headers["x-api-key"]), headers: { ...request.headers }, body });
     if (request.url !== "/v1/messages?beta=true") this.violations.push(`path=${request.url}`);
     if (singleHeader(request.headers["x-api-key"]) !== "integration-anthropic-key") this.violations.push("api-key");
     if (body.model !== "backend-private") this.violations.push(`model=${String(body.model)}`);

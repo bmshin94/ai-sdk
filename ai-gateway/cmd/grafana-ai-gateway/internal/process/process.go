@@ -18,6 +18,8 @@ import (
 	"github.com/grafana/authlib/authn"
 )
 
+const listenerStartupTimeout = 5 * time.Second
+
 const (
 	processEventStarting          = "process_starting"
 	processEventReady             = "process_ready"
@@ -37,7 +39,7 @@ func Run(ctx context.Context, args []string, lookupEnv config.LookupEnv, listen 
 		return err
 	}
 	jwksURL := ""
-	if !settings.AuthUnsafe {
+	if settings.AuthMode == config.AuthModeAccessToken && !settings.AuthUnsafe {
 		parsed, err := outbound.ValidateEndpoint(settings.JWKSURL, settings.DeploymentMode)
 		if err != nil {
 			return fmt.Errorf("gateway process: validating JWKS endpoint: %w", err)
@@ -63,36 +65,42 @@ func Run(ctx context.Context, args []string, lookupEnv config.LookupEnv, listen 
 	if err != nil {
 		return err
 	}
-	clients, err := outbound.NewClients(
-		settings.JWKSRequestTimeout,
-		settings.AnthropicResponseHeaderTimeout,
-		settings.JWKSResponseBytes,
-		settings.AnthropicResponseBytes,
-	)
+	anthropicClient, err := outbound.NewAnthropicClient(settings.AnthropicResponseHeaderTimeout, settings.AnthropicResponseBytes)
 	if err != nil {
 		return err
 	}
 
 	processContext, cancelProcess := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelProcess()
-	var authenticator authn.Authenticator
-	if settings.AuthUnsafe {
-		authenticator, err = gatewayauth.NewUnsafeAuthenticator(settings.Audiences, func(message string) {
-			logger.Warn(message)
-		})
-	} else {
-		var keys *gatewayauth.JWKS
-		keys, err = gatewayauth.NewJWKS(processContext, clients.JWKS, time.Now, gatewayauth.JWKSConfig{
-			URL:             jwksURL,
-			RequestTimeout:  settings.JWKSRequestTimeout,
-			MaxKeys:         settings.JWKSMaxKeys,
-			RefreshInterval: settings.JWKSRefreshInterval,
-			MaxAge:          settings.JWKSMaxAge,
-		})
-		if err != nil {
-			return err
+	var authenticator gatewayauth.RequestAuthenticator
+	switch settings.AuthMode {
+	case config.AuthModeCloudGateway:
+		authenticator = gatewayauth.NewCloudProviderWireAuthenticator()
+	case config.AuthModeAccessToken:
+		var verifier authn.Authenticator
+		if settings.AuthUnsafe {
+			verifier, err = gatewayauth.NewUnsafeAuthenticator(settings.Audiences, func(message string) {
+				logger.Warn(message)
+			})
+		} else {
+			jwksClient, clientErr := outbound.NewJWKSClient(settings.JWKSRequestTimeout, settings.JWKSResponseBytes)
+			if clientErr != nil {
+				return clientErr
+			}
+			var keys *gatewayauth.JWKS
+			keys, err = gatewayauth.NewJWKS(processContext, jwksClient, time.Now, gatewayauth.JWKSConfig{
+				URL:             jwksURL,
+				RequestTimeout:  settings.JWKSRequestTimeout,
+				MaxKeys:         settings.JWKSMaxKeys,
+				RefreshInterval: settings.JWKSRefreshInterval,
+				MaxAge:          settings.JWKSMaxAge,
+			})
+			if err != nil {
+				return err
+			}
+			verifier, err = gatewayauth.NewAuthenticator(keys, settings.Audiences)
 		}
-		authenticator, err = gatewayauth.NewAuthenticator(keys, settings.Audiences)
+		authenticator = gatewayauth.NewAccessTokenAuthenticator(verifier)
 	}
 	if err != nil {
 		return err
@@ -113,7 +121,7 @@ func Run(ctx context.Context, args []string, lookupEnv config.LookupEnv, listen 
 		agentRuntime.Close()
 		return err
 	}
-	modelCatalog, err := service.BuildCatalog(file, resolvedProviders, clients.Anthropic, modelFactory)
+	modelCatalog, err := service.BuildCatalog(file, resolvedProviders, anthropicClient, modelFactory)
 	if err != nil {
 		agentRuntime.Close()
 		return err
@@ -130,53 +138,116 @@ func Run(ctx context.Context, args []string, lookupEnv config.LookupEnv, listen 
 		return err
 	}
 	readiness := &service.Readiness{}
-	router := service.NewRouter(service.RouterDependencies{
+	deps := service.RouterDependencies{
 		Readiness:     readiness,
 		Telemetry:     telemetry,
 		Authenticator: authenticator,
+		AuthSource:    gatewayauth.Source(settings.AuthMode),
 		ErrorWriter:   errorWriter,
 		Discovery:     discoveryHandler,
 		LanguageModel: languageHandler,
-	})
-	listener, err := listen("tcp", settings.ListenAddress)
-	if err != nil {
-		agentRuntime.Close()
-		return fmt.Errorf("gateway process: binding listener: %w", err)
 	}
-	server := &http.Server{
-		Handler:           router,
-		ReadHeaderTimeout: settings.ReadHeaderTimeout,
-		ReadTimeout:       settings.ReadTimeout,
-		WriteTimeout:      settings.WriteTimeout,
-		IdleTimeout:       settings.IdleTimeout,
-		MaxHeaderBytes:    settings.MaxHeaderBytes,
-		BaseContext: func(net.Listener) context.Context {
-			return processContext
-		},
+	var handlers []http.Handler
+	addresses := []string{settings.ListenAddress}
+	if settings.OperationalListenAddress != "" {
+		handlers = []http.Handler{service.NewAPIRouter(deps), service.NewOperationalRouter(deps)}
+		addresses = append(addresses, settings.OperationalListenAddress)
+	} else {
+		handlers = []http.Handler{service.NewRouter(deps)}
 	}
-	return Serve(ctx, cancelProcess, server, listener, readiness, telemetry, logger, settings.ShutdownTimeout, agentRuntime.Close)
+	var servers []boundServer
+	for i, address := range addresses {
+		listener, err := listen("tcp", address)
+		if err != nil {
+			for _, binding := range servers {
+				_ = binding.listener.Close()
+			}
+			agentRuntime.Close()
+			return fmt.Errorf("gateway process: binding listener: %w", err)
+		}
+		servers = append(servers, boundServer{
+			listener: listener,
+			server: &http.Server{
+				Handler:           handlers[i],
+				ReadHeaderTimeout: settings.ReadHeaderTimeout,
+				ReadTimeout:       settings.ReadTimeout,
+				WriteTimeout:      settings.WriteTimeout,
+				IdleTimeout:       settings.IdleTimeout,
+				MaxHeaderBytes:    settings.MaxHeaderBytes,
+				BaseContext:       func(net.Listener) context.Context { return processContext },
+			},
+		})
+	}
+	return Serve(ctx, cancelProcess, servers, readiness, telemetry, logger, settings.ShutdownTimeout, agentRuntime.Close)
+}
+
+type boundServer struct {
+	server   *http.Server
+	listener net.Listener
 }
 
 // Serve owns readiness and cancel-first graceful HTTP shutdown, then runs the
 // optional caller-bounded process finalizer before reporting shutdown completion.
-func Serve(ctx context.Context, cancel context.CancelFunc, server *http.Server, listener net.Listener, readiness *service.Readiness, telemetry *service.Telemetry, logger *slog.Logger, shutdownTimeout time.Duration, finalize func()) error {
-	if shutdownTimeout <= 0 {
+func Serve(ctx context.Context, cancel context.CancelFunc, servers []boundServer, readiness *service.Readiness, telemetry *service.Telemetry, logger *slog.Logger, shutdownTimeout time.Duration, finalize func()) error {
+	if shutdownTimeout <= 0 || len(servers) == 0 {
 		return fmt.Errorf("gateway process: invalid serve dependency")
 	}
-	serveErrors := make(chan error, 1)
-	go func() {
-		serveErrors <- server.Serve(listener)
-	}()
-	readiness.Set(true)
-	telemetry.SetReady(true)
-	logProcessEvent(logger, processEventReady)
+	startupContext, cancelStartup := context.WithTimeout(ctx, listenerStartupTimeout)
+	defer cancelStartup()
+	accepted := make(chan struct{}, len(servers))
+	release := make(chan struct{})
+	probeErrors := make(chan error, len(servers))
+	serveErrors := make(chan error, len(servers))
+	for _, binding := range servers {
+		listener := &startupListener{Listener: binding.listener, accepted: accepted, release: release}
+		go func() { serveErrors <- binding.server.Serve(listener) }()
+		go func() { probeErrors <- probeListener(startupContext, binding.listener.Addr()) }()
+	}
 
-	var serveErr error
-	serverStopped := false
-	select {
-	case serveErr = <-serveErrors:
-		serverStopped = true
-	case <-ctx.Done():
+	var result error
+	remaining := len(servers)
+	pendingAccepts, pendingProbes := len(servers), len(servers)
+startup:
+	for pendingAccepts > 0 || pendingProbes > 0 {
+		select {
+		case <-accepted:
+			pendingAccepts--
+		case err := <-probeErrors:
+			pendingProbes--
+			if err != nil {
+				if ctx.Err() == nil {
+					result = fmt.Errorf("gateway process: probing listener: %w", err)
+				}
+				break startup
+			}
+		case err := <-serveErrors:
+			remaining--
+			result = fmt.Errorf("gateway process: serving HTTP: %w", err)
+			break startup
+		case <-startupContext.Done():
+			if ctx.Err() == nil {
+				result = fmt.Errorf("gateway process: starting listeners: %w", startupContext.Err())
+			}
+			break startup
+		}
+	}
+	if result == nil && ctx.Err() == nil {
+		readiness.Set(true)
+		telemetry.SetReady(true)
+		logProcessEvent(logger, processEventReady)
+	}
+	close(release)
+	cancelStartup()
+	for range pendingProbes {
+		<-probeErrors
+	}
+	if result == nil && ctx.Err() == nil {
+		select {
+		case err := <-serveErrors:
+			remaining--
+			result = fmt.Errorf("gateway process: serving HTTP: %w", err)
+		case <-ctx.Done():
+		}
 	}
 
 	readiness.Set(false)
@@ -187,27 +258,66 @@ func Serve(ctx context.Context, cancel context.CancelFunc, server *http.Server, 
 		defer finalize()
 	}
 	cancel()
-	if serverStopped {
-		if serveErr == nil || errors.Is(serveErr, http.ErrServerClosed) {
-			return nil
-		}
-		return fmt.Errorf("gateway process: serving HTTP: %w", serveErr)
-	}
-
 	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
-	shutdownErr := server.Shutdown(shutdownContext)
-	if shutdownErr != nil {
-		_ = server.Close()
+	shutdownErrors := make(chan error, len(servers))
+	for _, binding := range servers {
+		go func() {
+			err := binding.server.Shutdown(shutdownContext)
+			if err != nil {
+				_ = binding.server.Close()
+			}
+			shutdownErrors <- err
+		}()
 	}
-	serveErr = <-serveErrors
-	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-		return fmt.Errorf("gateway process: serving HTTP: %w", serveErr)
+	for range servers {
+		if err := <-shutdownErrors; err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			result = errors.Join(result, fmt.Errorf("gateway process: shutting down HTTP: %w", err))
+		}
 	}
-	if shutdownErr != nil && !errors.Is(shutdownErr, context.DeadlineExceeded) {
-		return fmt.Errorf("gateway process: shutting down HTTP: %w", shutdownErr)
+	for range remaining {
+		if err := <-serveErrors; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			result = errors.Join(result, fmt.Errorf("gateway process: serving HTTP: %w", err))
+		}
 	}
-	return nil
+	return result
+}
+
+type startupListener struct {
+	net.Listener
+	accepted chan<- struct{}
+	release  <-chan struct{}
+}
+
+func (listener *startupListener) Accept() (net.Conn, error) {
+	connection, err := listener.Listener.Accept()
+	if err == nil && listener.accepted != nil {
+		listener.accepted <- struct{}{}
+		<-listener.release
+		listener.accepted = nil
+	}
+	return connection, err
+}
+
+func probeListener(ctx context.Context, address net.Addr) error {
+	target := address.String()
+	switch address := address.(type) {
+	case *net.TCPAddr:
+		if address.IP.IsUnspecified() {
+			probeAddress := *address
+			probeAddress.IP = net.IPv6loopback
+			if address.IP.To4() != nil {
+				probeAddress.IP = net.IPv4(127, 0, 0, 1)
+			}
+			target = probeAddress.String()
+		}
+	}
+	var dialer net.Dialer
+	connection, err := dialer.DialContext(ctx, address.Network(), target)
+	if err != nil {
+		return err
+	}
+	return connection.Close()
 }
 
 func logProcessEvent(logger *slog.Logger, event string) {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/grafana/ai-sdk/ai-gateway/catalog"
+	gatewayauth "github.com/grafana/ai-sdk/ai-gateway/cmd/grafana-ai-gateway/internal/auth"
 	providerv4 "github.com/grafana/ai-sdk/ai-gateway/providerwire/v4"
 	"github.com/grafana/ai-sdk/provider"
 	"github.com/stretchr/testify/assert"
@@ -21,6 +23,24 @@ import (
 )
 
 func TestRouter_PreservesProviderWireFlushWhileStreamIsOpen(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		build  func(RouterDependencies) http.Handler
+		source gatewayauth.Source
+		split  bool
+	}{
+		{"combined", NewRouter, gatewayauth.SourceAccessToken, false},
+		{"internal split", NewAPIRouter, gatewayauth.SourceAccessToken, true},
+		{"Cloud API", NewAPIRouter, gatewayauth.SourceCloudGateway, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testRouterOpenStream(t, tc.build, tc.source, tc.split)
+		})
+	}
+}
+
+func testRouterOpenStream(t *testing.T, build func(RouterDependencies) http.Handler, source gatewayauth.Source, split bool) {
+	t.Helper()
 	model := &openStreamModel{canceled: make(chan struct{})}
 	modelCatalog, err := catalog.NewStatic([]catalog.StaticEntry{{Info: catalog.ModelInfo{ID: "public"}, Model: model}})
 	require.NoError(t, err)
@@ -33,10 +53,12 @@ func TestRouter_PreservesProviderWireFlushWhileStreamIsOpen(t *testing.T) {
 	readiness := &Readiness{}
 	readiness.Set(true)
 	errorWriter := providerv4.NewHostErrorWriter()
-	router := NewRouter(RouterDependencies{
+	authenticator, headers := serviceModeAuthentication(source)
+	router := build(RouterDependencies{
 		Readiness:     readiness,
 		Telemetry:     telemetry,
-		Authenticator: &serviceAuthenticator{info: serviceAuthInfo()},
+		AuthSource:    source,
+		Authenticator: authenticator,
 		ErrorWriter:   errorWriter,
 		Discovery:     http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
 		LanguageModel: language,
@@ -44,11 +66,18 @@ func TestRouter_PreservesProviderWireFlushWhileStreamIsOpen(t *testing.T) {
 	server := httptest.NewServer(router)
 	defer server.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	operational := server
+	if split {
+		operational = httptest.NewServer(NewOperationalRouter(RouterDependencies{Readiness: readiness, Telemetry: telemetry}))
+		defer operational.Close()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/api/v1/aisdk/language-model", strings.NewReader(`{"prompt":[]}`))
 	require.NoError(t, err)
+	request.Header = headers.Clone()
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-Access-Token", "access")
 	request.Header.Set(providerv4.HeaderSpecificationVersion, providerv4.SpecificationVersion)
 	request.Header.Set(providerv4.HeaderModelID, "public")
 	request.Header.Set(providerv4.HeaderStreaming, "true")
@@ -86,6 +115,14 @@ func TestRouter_PreservesProviderWireFlushWhileStreamIsOpen(t *testing.T) {
 	default:
 	}
 
+	metricsResponse, err := operational.Client().Get(operational.URL + "/metrics")
+	require.NoError(t, err)
+	metrics, err := io.ReadAll(metricsResponse.Body)
+	_ = metricsResponse.Body.Close()
+	require.NoError(t, err)
+	assert.Contains(t, string(metrics), `grafana_ai_gateway_http_requests_in_flight{method="POST",route="language_model"} 1`)
+	assert.Contains(t, string(metrics), `grafana_ai_gateway_authentication_total{outcome="authenticated",source="`+string(source)+`"} 1`)
+
 	cancel()
 	_ = response.Body.Close()
 	select {
@@ -94,8 +131,16 @@ func TestRouter_PreservesProviderWireFlushWhileStreamIsOpen(t *testing.T) {
 		t.Fatal("provider context was not canceled")
 	}
 	require.Eventually(t, func() bool {
-		return strings.Count(logs.String(), "http request completed") == 1
+		return strings.Count(logs.String(), `"route":"language_model"`) == 1
 	}, 2*time.Second, 10*time.Millisecond)
+	assert.Contains(t, logs.String(), `"authentication_source":"`+string(source)+`"`)
+	metricsAfter := telemetryMetrics(telemetry)
+	assert.Contains(t, metricsAfter, `grafana_ai_gateway_http_requests_in_flight{method="POST",route="language_model"} 0`)
+	assert.Contains(t, metricsAfter, `grafana_ai_gateway_http_requests_total{method="POST",route="language_model",status="2xx"} 1`)
+	for _, private := range []string{"private-access-token", "private-policy", "123456789", "987654321", "backend-private"} {
+		assert.NotContains(t, logs.String(), private)
+		assert.NotContains(t, metricsAfter, private)
+	}
 }
 
 func serviceTestLimits() providerv4.Limits {

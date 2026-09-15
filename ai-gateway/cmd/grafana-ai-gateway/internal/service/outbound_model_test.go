@@ -104,7 +104,7 @@ func TestAnthropicModel_HardenedTimeoutAndCumulativeStreamBound(t *testing.T) {
 
 func hardenedTestModel(t *testing.T, server *httptest.Server, limit int64, headerTimeout time.Duration) provider.LanguageModel {
 	t.Helper()
-	clients, err := outbound.NewClients(time.Second, headerTimeout, 1024, limit)
+	client, err := outbound.NewAnthropicClient(headerTimeout, limit)
 	require.NoError(t, err)
 	file := config.File{
 		Providers: map[string]config.Provider{"provider": {Type: "anthropic", APIKeyEnv: "KEY", BaseURL: server.URL}},
@@ -112,7 +112,7 @@ func hardenedTestModel(t *testing.T, server *httptest.Server, limit int64, heade
 	}
 	modelCatalog, err := BuildCatalog(file, map[string]config.ResolvedProvider{
 		"provider": {Type: "anthropic", APIKey: "explicit-key", BaseURL: server.URL},
-	}, clients.Anthropic, identityModelFactory)
+	}, client, identityModelFactory)
 	require.NoError(t, err)
 	resolved, err := modelCatalog.ResolveModel(context.Background(), "public")
 	require.NoError(t, err)

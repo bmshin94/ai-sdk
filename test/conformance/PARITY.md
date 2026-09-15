@@ -145,6 +145,12 @@ The following differences are explicit rather than claims of complete parity:
 
 No provider recordings or provenance fixtures were fabricated or regenerated.
 
+### Trusted Cloud Gateway Host Coverage
+
+| Capability | Status | Confidence Source | Gap / Notes |
+| --- | --- | --- | --- |
+| Trusted reverse-proxy application composition | automated | Gateway Go tests cover distinct trusted identities, malformed assertions, authentication before body reads, internal JWT isolation, mode-specific dependencies, separate listeners, shared shutdown deadlines, flushing, and fixed-value authentication telemetry. `ai-gateway/test/providerwire-v4/gateway-command.test.ts` exercises the real command through a local edge shim with `@ai-sdk/gateway@4.0.52`. It separates fixed edge denials, overwritten client assertions, and malformed post-edge assertions, and checks credential privacy. | Grafana host extension with no upstream service equivalent. The shim uses dummy credentials and fixed authorization outcomes; it does not prove deployed proxy authentication, access-policy enforcement, or proxy-only ingress. Deployment owners must verify ingress before activation. Client evidence is limited to discovery and low-level `doGenerate`/`doStream` with explicit `maxOutputTokens`. In `ai@7.0.65`, both high-level calls default `toolChoice` to `{ type: "auto" }`, which the mapper rejects. `generateText` also adds body headers; `streamText` only forwards supplied headers. Explicit `maxOutputTokens` does not resolve these incompatibilities. Default unary token limits remain a separate gap. No client requests or provider fixture inputs are rewritten. |
+
 ### Provider Implementation Layer
 
 | Capability | Status | Confidence Source | Gap / Notes |

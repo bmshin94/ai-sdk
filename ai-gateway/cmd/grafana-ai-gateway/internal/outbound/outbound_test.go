@@ -54,16 +54,18 @@ func TestValidateEndpoint(t *testing.T) {
 }
 
 func TestNewClients_IndependentExactTransports(t *testing.T) {
-	clients, err := NewClients(5*time.Second, 10*time.Second, 1024, 2048)
+	jwks, err := NewJWKSClient(5*time.Second, 1024)
 	require.NoError(t, err)
-	jwksBounded := requireBoundedTransport(t, clients.JWKS)
-	anthropicBounded := requireBoundedTransport(t, clients.Anthropic)
+	anthropic, err := NewAnthropicClient(10*time.Second, 2048)
+	require.NoError(t, err)
+	jwksBounded := requireBoundedTransport(t, jwks)
+	anthropicBounded := requireBoundedTransport(t, anthropic)
 	assert.NotSame(t, jwksBounded, anthropicBounded)
 	assert.NotSame(t, jwksBounded.base, anthropicBounded.base)
 	assert.Equal(t, int64(1024), jwksBounded.limit)
 	assert.Equal(t, int64(2048), anthropicBounded.limit)
-	assert.Equal(t, 5*time.Second, clients.JWKS.Timeout)
-	assert.Zero(t, clients.Anthropic.Timeout)
+	assert.Equal(t, 5*time.Second, jwks.Timeout)
+	assert.Zero(t, anthropic.Timeout)
 
 	for _, tc := range []struct {
 		name      string
@@ -74,6 +76,10 @@ func TestNewClients_IndependentExactTransports(t *testing.T) {
 		{name: "anthropic", transport: anthropicBounded.base.(*http.Transport), header: 10 * time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			assert.NotNil(t, tc.transport.Proxy)
+			assert.NotNil(t, tc.transport.DialContext)
+			assert.True(t, tc.transport.ForceAttemptHTTP2)
+			assert.False(t, tc.transport.DisableCompression)
 			assert.Equal(t, outboundMaxIdleConns, tc.transport.MaxIdleConns)
 			assert.Equal(t, outboundMaxIdleConnsPerHost, tc.transport.MaxIdleConnsPerHost)
 			assert.Equal(t, outboundMaxConnsPerHost, tc.transport.MaxConnsPerHost)
@@ -112,9 +118,11 @@ func TestClients_RejectRedirectsBeforeCredentialForwarding(t *testing.T) {
 			}))
 			defer source.Close()
 
-			clients, err := NewClients(time.Second, time.Second, 1024, 1024)
+			jwks, err := NewJWKSClient(time.Second, 1024)
 			require.NoError(t, err)
-			for _, client := range []*http.Client{clients.JWKS, clients.Anthropic} {
+			anthropic, err := NewAnthropicClient(time.Second, 1024)
+			require.NoError(t, err)
+			for _, client := range []*http.Client{jwks, anthropic} {
 				request, err := http.NewRequest(http.MethodGet, source.URL, nil)
 				require.NoError(t, err)
 				request.Header.Set("X-Access-Token", "secret-access")
@@ -165,18 +173,20 @@ func TestBoundedTransport_DecompressedResponseBoundaries(t *testing.T) {
 
 				for _, delta := range []int64{1, 0, -1} {
 					limit := int64(len(payload.payload)) + delta
-					clients, err := NewClients(time.Second, time.Second, limit, limit)
-					require.NoError(t, err)
-					response, err := clients.Anthropic.Get(server.URL)
-					require.NoError(t, err)
-					body, readErr := io.ReadAll(response.Body)
-					_ = response.Body.Close()
-					if delta >= 0 {
-						require.NoError(t, readErr)
-						assert.Equal(t, payload.payload, string(body))
-					} else {
-						require.ErrorIs(t, readErr, ErrResponseTooLarge)
-						assert.Len(t, body, int(limit))
+					for _, newClient := range []func(time.Duration, int64) (*http.Client, error){NewJWKSClient, NewAnthropicClient} {
+						client, err := newClient(time.Second, limit)
+						require.NoError(t, err)
+						response, err := client.Get(server.URL)
+						require.NoError(t, err)
+						body, readErr := io.ReadAll(response.Body)
+						_ = response.Body.Close()
+						if delta >= 0 {
+							require.NoError(t, readErr)
+							assert.Equal(t, payload.payload, string(body))
+						} else {
+							require.ErrorIs(t, readErr, ErrResponseTooLarge)
+							assert.Len(t, body, int(limit))
+						}
 					}
 				}
 			})
@@ -205,9 +215,9 @@ func TestClients_HostileServersTerminateWithinBounds(t *testing.T) {
 			<-request.Context().Done()
 		}))
 		defer server.Close()
-		clients, err := NewClients(time.Second, 50*time.Millisecond, 1024, 1024)
+		client, err := NewAnthropicClient(50*time.Millisecond, 1024)
 		require.NoError(t, err)
-		_, err = clients.Anthropic.Get(server.URL)
+		_, err = client.Get(server.URL)
 		require.Error(t, err)
 	})
 
@@ -220,19 +230,61 @@ func TestClients_HostileServersTerminateWithinBounds(t *testing.T) {
 			<-request.Context().Done()
 		}))
 		defer server.Close()
-		clients, err := NewClients(time.Second, time.Second, 1024, 1024)
+		client, err := NewAnthropicClient(time.Second, 1024)
 		require.NoError(t, err)
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		defer cancel()
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
 		require.NoError(t, err)
-		response, err := clients.Anthropic.Do(request)
+		response, err := client.Do(request)
 		require.NoError(t, err)
 		_, err = io.ReadAll(response.Body)
 		_ = response.Body.Close()
 		require.Error(t, err)
 		assert.True(t, errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled))
 	})
+
+	t.Run("JWKS stalled body timeout", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			assert.NoError(t, http.NewResponseController(w).Flush())
+			<-request.Context().Done()
+		}))
+		defer server.Close()
+		client, err := NewJWKSClient(50*time.Millisecond, 1024)
+		require.NoError(t, err)
+		response, err := client.Get(server.URL)
+		require.NoError(t, err)
+		defer func() { _ = response.Body.Close() }()
+		_, err = io.ReadAll(response.Body)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	})
+}
+
+func TestNewClients_InvalidLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		newClient func(time.Duration, int64) (*http.Client, error)
+	}{
+		{name: "jwks", newClient: NewJWKSClient},
+		{name: "anthropic", newClient: NewAnthropicClient},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, limits := range []struct {
+				timeout time.Duration
+				bytes   int64
+			}{
+				{timeout: 0, bytes: 1},
+				{timeout: -time.Second, bytes: 1},
+				{timeout: time.Second, bytes: 0},
+				{timeout: time.Second, bytes: -1},
+			} {
+				client, err := tc.newClient(limits.timeout, limits.bytes)
+				require.Error(t, err)
+				assert.Nil(t, client)
+			}
+		})
+	}
 }
 
 func requireBoundedTransport(t *testing.T, client *http.Client) *boundedTransport {
