@@ -191,9 +191,9 @@ func TestJWKS_ResponseByteBoundaries(t *testing.T) {
 			}))
 			defer server.Close()
 			for _, delta := range []int64{0, -1} {
-				clients, err := outbound.NewClients(time.Second, time.Second, int64(len(body))+delta, 1024)
+				client, err := outbound.NewJWKSClient(time.Second, int64(len(body))+delta)
 				require.NoError(t, err)
-				retriever := newTestJWKS(t, clients.JWKS, server.URL, time.Now, 1)
+				retriever := newTestJWKS(t, client, server.URL, time.Now, 1)
 				_, err = retriever.Get(context.Background(), "key")
 				if delta == 0 {
 					require.NoError(t, err)

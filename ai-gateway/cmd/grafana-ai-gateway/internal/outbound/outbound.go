@@ -28,32 +28,27 @@ var (
 	ErrResponseTooLarge = errors.New("gateway outbound: response exceeds byte limit")
 )
 
-// Clients contains independent hardened outbound clients.
-type Clients struct {
-	JWKS      *http.Client
-	Anthropic *http.Client
+// NewJWKSClient returns a client that rejects redirects and limits response bytes and total request time.
+func NewJWKSClient(timeout time.Duration, responseBytes int64) (*http.Client, error) {
+	client, err := NewAnthropicClient(timeout, responseBytes)
+	if err != nil {
+		return nil, err
+	}
+	client.Timeout = timeout
+	return client, nil
 }
 
-// NewClients constructs independent JWKS and Anthropic clients.
-func NewClients(jwksTimeout, anthropicHeaderTimeout time.Duration, jwksResponseBytes, anthropicResponseBytes int64) (Clients, error) {
-	if jwksTimeout <= 0 || anthropicHeaderTimeout <= 0 {
-		return Clients{}, fmt.Errorf("gateway outbound: timeouts must be positive")
+// NewAnthropicClient returns a streaming client that rejects redirects and limits response bytes and response-header wait time.
+func NewAnthropicClient(headerTimeout time.Duration, responseBytes int64) (*http.Client, error) {
+	if headerTimeout <= 0 {
+		return nil, fmt.Errorf("gateway outbound: timeout must be positive")
 	}
-	if jwksResponseBytes <= 0 || anthropicResponseBytes <= 0 {
-		return Clients{}, fmt.Errorf("gateway outbound: response limits must be positive")
+	if responseBytes <= 0 {
+		return nil, fmt.Errorf("gateway outbound: response byte limit must be positive")
 	}
-	jwksTransport := newTransport(jwksTimeout)
-	anthropicTransport := newTransport(anthropicHeaderTimeout)
-	return Clients{
-		JWKS: &http.Client{
-			Transport:     &boundedTransport{base: jwksTransport, limit: jwksResponseBytes},
-			Timeout:       jwksTimeout,
-			CheckRedirect: rejectRedirect,
-		},
-		Anthropic: &http.Client{
-			Transport:     &boundedTransport{base: anthropicTransport, limit: anthropicResponseBytes},
-			CheckRedirect: rejectRedirect,
-		},
+	return &http.Client{
+		Transport:     &boundedTransport{base: newTransport(headerTimeout), limit: responseBytes},
+		CheckRedirect: rejectRedirect,
 	}, nil
 }
 

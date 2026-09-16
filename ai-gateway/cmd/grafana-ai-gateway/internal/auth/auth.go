@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strings"
 
-	providerv4 "github.com/grafana/ai-sdk/ai-gateway/providerwire/v4"
 	"github.com/grafana/authlib/authn"
 	"github.com/grafana/authlib/types"
 )
@@ -23,17 +22,30 @@ const (
 	OutcomeFailed
 )
 
-// Observation carries a closed outcome and an optional normalized caller.
+// Observation contains an authentication result and normalized caller, when available.
 type Observation struct {
+	Source  Source
 	Outcome Outcome
 	Caller  *Caller
 }
 
+// Source identifies the configured authentication mode.
+type Source string
+
+const (
+	// SourceAccessToken identifies JWT authentication.
+	SourceAccessToken Source = "access-token"
+	// SourceCloudGateway identifies authentication by trusted proxy assertions.
+	SourceCloudGateway Source = "cloud-gateway"
+)
+
 // Caller is the private normalized authenticated caller retained in context.
 type Caller struct {
+	Source     Source
 	Service    string
 	Namespace  string
 	ActingUser *ActingUser
+	stackID    int64
 }
 
 // ActingUser is an optional verified non-access-policy identity.
@@ -99,25 +111,39 @@ func newVerifierConfig(audiences []string) (authn.VerifierConfig, error) {
 	return authn.VerifierConfig{AllowedAudiences: audiences}, nil
 }
 
+// RequestAuthenticator authenticates headers without access to the request body.
+type RequestAuthenticator interface {
+	Authenticate(context.Context, http.Header) (Caller, error)
+}
+
+type accessTokenAuthenticator struct {
+	verifier authn.Authenticator
+}
+
+// NewAccessTokenAuthenticator adapts JWT verification to RequestAuthenticator.
+func NewAccessTokenAuthenticator(verifier authn.Authenticator) RequestAuthenticator {
+	return accessTokenAuthenticator{verifier: verifier}
+}
+
+func (authenticator accessTokenAuthenticator) Authenticate(ctx context.Context, headers http.Header) (Caller, error) {
+	provider, err := normalizeHeaders(headers)
+	if err != nil {
+		return Caller{}, err
+	}
+	info, err := authenticator.verifier.Authenticate(ctx, provider)
+	if err != nil {
+		return Caller{}, err
+	}
+	return callerFromAuthInfo(info)
+}
+
 // Middleware authenticates a protected route before invoking next.
-func Middleware(authenticator authn.Authenticator, errors *providerv4.HostErrorWriter, observe func(context.Context, Observation), next http.Handler) http.Handler {
+func Middleware(authenticator RequestAuthenticator, writeFailure func(http.ResponseWriter), observe func(context.Context, Observation), next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		provider, err := normalizeHeaders(request.Header)
+		caller, err := authenticator.Authenticate(request.Context(), request.Header)
 		if err != nil {
 			observe(request.Context(), Observation{Outcome: OutcomeFailed})
-			errors.Write(w, providerv4.HostErrorAuthentication)
-			return
-		}
-		info, err := authenticator.Authenticate(request.Context(), provider)
-		if err != nil {
-			observe(request.Context(), Observation{Outcome: OutcomeFailed})
-			errors.Write(w, providerv4.HostErrorAuthentication)
-			return
-		}
-		caller, err := callerFromAuthInfo(info)
-		if err != nil {
-			observe(request.Context(), Observation{Outcome: OutcomeFailed})
-			errors.Write(w, providerv4.HostErrorAuthentication)
+			writeFailure(w)
 			return
 		}
 		observe(request.Context(), Observation{Outcome: OutcomeAuthenticated, Caller: &caller})
@@ -150,15 +176,17 @@ func normalizeHeaders(headers http.Header) (tokenProvider, error) {
 
 func exactlyOneHeader(headers http.Header, name string, required bool) (string, error) {
 	var values []string
+	matches := 0
 	for key, candidates := range headers {
 		if strings.EqualFold(key, name) {
+			matches++
 			values = append(values, candidates...)
 		}
 	}
-	if len(values) == 0 && !required {
+	if matches == 0 && !required {
 		return "", nil
 	}
-	if len(values) != 1 || values[0] == "" || strings.Contains(values[0], ",") {
+	if matches != 1 || len(values) != 1 || values[0] == "" || strings.Contains(values[0], ",") {
 		return "", fmt.Errorf("gateway auth: invalid %s header", name)
 	}
 	return values[0], nil
@@ -177,7 +205,7 @@ func callerFromAuthInfo(info types.AuthInfo) (Caller, error) {
 	if strings.TrimSpace(namespace) == "" {
 		return Caller{}, fmt.Errorf("gateway auth: namespace is required")
 	}
-	caller := Caller{Service: identities[0], Namespace: namespace}
+	caller := Caller{Source: SourceAccessToken, Service: identities[0], Namespace: namespace}
 	if identityType := info.GetIdentityType(); identityType != types.TypeAccessPolicy {
 		caller.ActingUser = &ActingUser{Subject: info.GetSubject(), Type: identityType}
 	}

@@ -126,7 +126,7 @@ func TestRouter_AuthenticationFailureTelemetryUsesFixedClassOnce(t *testing.T) {
 	handler := NewRouter(RouterDependencies{
 		Readiness:     readiness,
 		Telemetry:     telemetry,
-		Authenticator: &serviceAuthenticator{err: errors.New("private verifier detail")},
+		Authenticator: gatewayauth.NewAccessTokenAuthenticator(&serviceAuthenticator{err: errors.New("private verifier detail")}),
 		ErrorWriter:   errorWriter,
 		Discovery:     http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
 		LanguageModel: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
@@ -282,6 +282,280 @@ func TestTelemetry_AgentExportFailuresUseOnlyFixedDiagnosticsAndBoundedLabels(t 
 	assert.NotContains(t, serialized, "bearer-secret")
 }
 
+func TestTelemetry_AuthenticationClosedNormalizationAndPrivacy(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		source                  gatewayauth.Source
+		outcome                 gatewayauth.Outcome
+		wantSource, wantOutcome string
+	}{
+		{"access success", gatewayauth.SourceAccessToken, gatewayauth.OutcomeAuthenticated, "access-token", "authenticated"},
+		{"cloud failure", gatewayauth.SourceCloudGateway, gatewayauth.OutcomeFailed, "cloud-gateway", "authentication_failed"},
+		{"zero", "", 0, "unknown", "not_attempted"},
+		{"untrusted", "private-source", 255, "unknown", "not_attempted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			telemetry, err := NewTelemetry(slog.New(slog.NewJSONHandler(&logs, nil)))
+			require.NoError(t, err)
+			handler := telemetry.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				telemetry.ObserveAuthentication(r.Context(), gatewayauth.Observation{
+					Source: tc.source, Outcome: tc.outcome,
+					Caller: &gatewayauth.Caller{Source: "private-caller-source", Service: "private-service", Namespace: "private-namespace", ActingUser: &gatewayauth.ActingUser{Subject: "private-subject"}},
+				})
+				w.WriteHeader(http.StatusOK)
+			}))
+			handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/live", nil))
+			metrics := telemetryMetrics(telemetry)
+			assert.Contains(t, metrics, `grafana_ai_gateway_authentication_total{outcome="`+tc.wantOutcome+`",source="`+tc.wantSource+`"} 1`)
+			assert.Contains(t, logs.String(), `"authentication":"`+tc.wantOutcome+`"`)
+			assert.Contains(t, logs.String(), `"authentication_source":"`+tc.wantSource+`"`)
+			for _, private := range []string{"private-source", "private-caller-source", "private-subject"} {
+				assert.NotContains(t, metrics, private)
+				assert.NotContains(t, logs.String(), private)
+			}
+		})
+	}
+}
+
+func TestRouter_RouteSeparationBothAuthenticationModes(t *testing.T) {
+	for _, source := range []gatewayauth.Source{gatewayauth.SourceAccessToken, gatewayauth.SourceCloudGateway} {
+		for _, composition := range []struct {
+			name             string
+			build            func(RouterDependencies) http.Handler
+			api, operational bool
+		}{
+			{"combined", NewRouter, true, true},
+			{"api", NewAPIRouter, true, false},
+			{"operational", NewOperationalRouter, false, true},
+		} {
+			t.Run(string(source)+"/"+composition.name, func(t *testing.T) {
+				telemetry, err := NewTelemetry(slog.New(slog.NewTextHandler(io.Discard, nil)))
+				require.NoError(t, err)
+				readiness := &Readiness{}
+				readiness.Set(true)
+				authenticator, headers := serviceModeAuthentication(source)
+				authCalls, protectedCalls := 0, 0
+				deps := RouterDependencies{Telemetry: telemetry}
+				if composition.operational {
+					deps.Readiness = readiness
+				}
+				if composition.api {
+					deps.AuthSource = source
+					deps.Authenticator = requestAuthenticatorFunc(func(ctx context.Context, h http.Header) (gatewayauth.Caller, error) {
+						authCalls++
+						return authenticator.Authenticate(ctx, h)
+					})
+					deps.ErrorWriter = providerv4.NewHostErrorWriter()
+					deps.Discovery = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						protectedCalls++
+						caller, ok := gatewayauth.CallerFromContext(r.Context())
+						assert.True(t, ok)
+						assert.Equal(t, source, caller.Source)
+						w.WriteHeader(http.StatusOK)
+					})
+					deps.LanguageModel = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						assert.Equal(t, providerv4.LanguageModelPath, r.URL.Path)
+						assert.Empty(t, r.URL.RawPath)
+						deps.Discovery.ServeHTTP(w, r)
+					})
+				}
+				handler := composition.build(deps)
+				for _, route := range []struct {
+					path, method string
+					api          bool
+				}{
+					{"/live", http.MethodGet, false},
+					{"/ready", http.MethodGet, false},
+					{"/metrics", http.MethodGet, false},
+					{"/api/v1/aisdk/config", http.MethodGet, true},
+					{"/api/v1/aisdk/language-model", http.MethodPost, true},
+				} {
+					for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodHead, http.MethodOptions, http.MethodPut} {
+						t.Run(method+route.path, func(t *testing.T) {
+							beforeAuth, beforeProtected := authCalls, protectedCalls
+							request := httptest.NewRequest(method, route.path, nil)
+							request.Header = headers.Clone()
+							response := httptest.NewRecorder()
+							handler.ServeHTTP(response, request)
+							present := (route.api && composition.api) || (!route.api && composition.operational)
+							switch {
+							case !present:
+								assert.Equal(t, http.StatusNotFound, response.Code)
+								assert.Empty(t, response.Header().Get("Allow"))
+							case method != route.method:
+								assert.Equal(t, http.StatusMethodNotAllowed, response.Code)
+								assert.Equal(t, route.method, response.Header().Get("Allow"))
+							default:
+								assert.Equal(t, http.StatusOK, response.Code)
+							}
+							if present && method == route.method && route.api {
+								assert.Equal(t, beforeAuth+1, authCalls)
+								assert.Equal(t, beforeProtected+1, protectedCalls)
+							} else {
+								assert.Equal(t, beforeAuth, authCalls)
+								assert.Equal(t, beforeProtected, protectedCalls)
+							}
+						})
+					}
+				}
+				beforeAuth := authCalls
+				for _, path := range []string{"/language-model", "/api/v1/aisdk", "/api/v1/aisdk/config/", "/api/v1/aisdk/language-model/", "/live/", "/ready/", "/metrics/", "/unknown", "/api%2Fv1%2Faisdk%2Fconfig", "/api/v1/aisdk/language%2Dmodel", "/%6cive", "/%72eady", "/%6detrics", "/api/v1/../v1/aisdk/config", "//live"} {
+					for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodHead} {
+						response := httptest.NewRecorder()
+						handler.ServeHTTP(response, httptest.NewRequest(method, path, nil))
+						assert.Equal(t, http.StatusNotFound, response.Code, method+path)
+						assert.Empty(t, response.Header().Get("Allow"))
+					}
+				}
+				assert.Equal(t, beforeAuth, authCalls)
+				if composition.api {
+					assert.Contains(t, telemetryMetrics(telemetry), `grafana_ai_gateway_authentication_total{outcome="authenticated",source="`+string(source)+`"} 2`)
+				} else {
+					assert.NotContains(t, telemetryMetrics(telemetry), "grafana_ai_gateway_authentication_total")
+				}
+				if composition.operational {
+					readiness.Set(false)
+					response := httptest.NewRecorder()
+					handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/ready", nil))
+					assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+				}
+			})
+		}
+	}
+}
+
+func TestRouter_FixedAuthenticationSourceIncludingFailures(t *testing.T) {
+	for _, source := range []gatewayauth.Source{gatewayauth.SourceAccessToken, gatewayauth.SourceCloudGateway} {
+		for _, tc := range []struct {
+			name, outcome string
+			err           error
+			status, calls int
+		}{
+			{"success", "authenticated", nil, http.StatusOK, 2},
+			{"failure", "authentication_failed", errors.New("private-verifier-detail"), http.StatusUnauthorized, 0},
+		} {
+			for _, composition := range []struct {
+				name  string
+				build func(RouterDependencies) http.Handler
+			}{{"combined", NewRouter}, {"api", NewAPIRouter}} {
+				t.Run(string(source)+"/"+composition.name+"/"+tc.name, func(t *testing.T) {
+					var logs bytes.Buffer
+					telemetry, err := NewTelemetry(slog.New(slog.NewJSONHandler(&logs, nil)))
+					require.NoError(t, err)
+					calls := 0
+					protected := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { calls++; w.WriteHeader(http.StatusOK) })
+					handler := composition.build(RouterDependencies{
+						Telemetry: telemetry, AuthSource: source, ErrorWriter: providerv4.NewHostErrorWriter(),
+						Authenticator: requestAuthenticatorFunc(func(context.Context, http.Header) (gatewayauth.Caller, error) {
+							return gatewayauth.Caller{Source: "private-source", Service: "private-service", Namespace: "private-namespace"}, tc.err
+						}),
+						Discovery: protected, LanguageModel: protected,
+					})
+					for _, route := range []struct{ method, path string }{
+						{http.MethodGet, "/api/v1/aisdk/config"}, {http.MethodPost, "/api/v1/aisdk/language-model"},
+					} {
+						request := httptest.NewRequest(route.method, route.path, &rejectReadBody{})
+						request.Header.Set("Authorization", "private-credential")
+						response := httptest.NewRecorder()
+						handler.ServeHTTP(response, request)
+						assert.Equal(t, tc.status, response.Code)
+					}
+					assert.Equal(t, tc.calls, calls)
+					metrics := telemetryMetrics(telemetry)
+					assert.Contains(t, metrics, `grafana_ai_gateway_authentication_total{outcome="`+tc.outcome+`",source="`+string(source)+`"} 2`)
+					assert.Equal(t, 2, strings.Count(logs.String(), `"authentication_source":"`+string(source)+`"`))
+					assert.Equal(t, 2, strings.Count(logs.String(), `"authentication":"`+tc.outcome+`"`))
+					for _, private := range []string{"private-credential", "private-verifier-detail", "private-source"} {
+						assert.NotContains(t, metrics, private)
+						assert.NotContains(t, logs.String(), private)
+					}
+					if source == gatewayauth.SourceCloudGateway || tc.err != nil {
+						for _, private := range []string{"private-service", "private-namespace"} {
+							assert.NotContains(t, metrics, private)
+							assert.NotContains(t, logs.String(), private)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestRouter_AuthenticationRejectionsBothModes(t *testing.T) {
+	for _, source := range []gatewayauth.Source{gatewayauth.SourceAccessToken, gatewayauth.SourceCloudGateway} {
+		for _, composition := range []struct {
+			name  string
+			build func(RouterDependencies) http.Handler
+		}{{"combined", NewRouter}, {"api", NewAPIRouter}} {
+			rejections := []string{"missing", "duplicate", "wrong mode"}
+			if source == gatewayauth.SourceCloudGateway {
+				rejections = append(rejections, "Authorization", "X-Access-Token", "X-Grafana-Id")
+			}
+			for _, rejection := range rejections {
+				t.Run(string(source)+"/"+composition.name+"/"+rejection, func(t *testing.T) {
+					telemetry, err := NewTelemetry(slog.New(slog.NewTextHandler(io.Discard, nil)))
+					require.NoError(t, err)
+					authenticator, headers := serviceModeAuthentication(source)
+					key := "X-Access-Token"
+					if source == gatewayauth.SourceCloudGateway {
+						key = "X-Scope-OrgID"
+					}
+					switch rejection {
+					case "missing":
+						headers.Del(key)
+					case "duplicate":
+						headers.Add(key, headers.Get(key))
+					case "wrong mode":
+						other := gatewayauth.SourceAccessToken
+						if source == other {
+							other = gatewayauth.SourceCloudGateway
+						}
+						_, headers = serviceModeAuthentication(other)
+					default:
+						headers.Set(rejection, "private-credential")
+					}
+					protected := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { assert.Fail(t, "rejected request reached protected handler") })
+					handler := composition.build(RouterDependencies{Telemetry: telemetry, AuthSource: source, Authenticator: authenticator, ErrorWriter: providerv4.NewHostErrorWriter(), Discovery: protected, LanguageModel: protected})
+					for _, route := range []struct{ method, path string }{
+						{http.MethodGet, "/api/v1/aisdk/config"}, {http.MethodPost, "/api/v1/aisdk/language-model"},
+					} {
+						body := &rejectReadBody{}
+						request := httptest.NewRequest(route.method, route.path, body)
+						request.Header = headers.Clone()
+						response := httptest.NewRecorder()
+						handler.ServeHTTP(response, request)
+						assert.Equal(t, http.StatusUnauthorized, response.Code)
+						assert.Zero(t, body.reads)
+					}
+					assert.Contains(t, telemetryMetrics(telemetry), `grafana_ai_gateway_authentication_total{outcome="authentication_failed",source="`+string(source)+`"} 2`)
+				})
+			}
+		}
+	}
+}
+
+func telemetryMetrics(telemetry *Telemetry) string {
+	response := httptest.NewRecorder()
+	telemetry.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	return response.Body.String()
+}
+
+type requestAuthenticatorFunc func(context.Context, http.Header) (gatewayauth.Caller, error)
+
+func (authenticate requestAuthenticatorFunc) Authenticate(ctx context.Context, headers http.Header) (gatewayauth.Caller, error) {
+	return authenticate(ctx, headers)
+}
+
+func serviceModeAuthentication(source gatewayauth.Source) (gatewayauth.RequestAuthenticator, http.Header) {
+	if source == gatewayauth.SourceCloudGateway {
+		return gatewayauth.NewCloudProviderWireAuthenticator(), http.Header{
+			"X-Scope-Orgid": {"123456789"},
+		}
+	}
+	return gatewayauth.NewAccessTokenAuthenticator(&serviceAuthenticator{info: serviceAuthInfo()}), http.Header{"X-Access-Token": {"private-access-token"}}
+}
+
 func newTestRouter(t *testing.T, authenticator authn.Authenticator, discovery, language http.Handler) http.Handler {
 	t.Helper()
 	telemetry, err := NewTelemetry(slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -293,7 +567,7 @@ func newTestRouter(t *testing.T, authenticator authn.Authenticator, discovery, l
 	return NewRouter(RouterDependencies{
 		Readiness:     readiness,
 		Telemetry:     telemetry,
-		Authenticator: authenticator,
+		Authenticator: gatewayauth.NewAccessTokenAuthenticator(authenticator),
 		ErrorWriter:   errorWriter,
 		Discovery:     discovery,
 		LanguageModel: language,

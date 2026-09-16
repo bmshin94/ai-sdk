@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -52,6 +53,45 @@ func TestRun_ValidatesScalarsAndEndpointsBeforeSecretsOrListener(t *testing.T) {
 		assert.Zero(t, secretCalls)
 		assert.Zero(t, listenCalls)
 	})
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		message string
+	}{
+		{name: "scalar failure", args: []string{"--server.write-timeout=1s"}, message: "write timeout"},
+		{name: "unknown auth mode", args: []string{"--auth.mode=invalid"}, message: "auth"},
+		{name: "cloud with JWKS", args: []string{"--auth.mode=cloud-gateway"}, message: "jwks"},
+		{name: "cloud with unsafe", args: []string{"--auth.mode=cloud-gateway", "--auth.unsafe", "--auth.jwks-url="}, message: "unsafe"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			secretCalls := 0
+			listenCalls := 0
+			err := Run(
+				context.Background(),
+				tc.args,
+				func(name string) (string, bool) {
+					if name == "ANTHROPIC_SECRET" {
+						secretCalls++
+					}
+					values := map[string]string{
+						"GRAFANA_AI_GATEWAY_CONFIG_FILE":               "/nonexistent/private.yaml",
+						"GRAFANA_AI_GATEWAY_AUTH_JWKS_URL":             "https://auth.example/jwks",
+						"GRAFANA_AI_GATEWAY_AGENTO11Y_ENABLED":         "true",
+						"GRAFANA_AI_GATEWAY_AGENTO11Y_ENDPOINT":        "collector.example:4317",
+						"GRAFANA_AI_GATEWAY_AGENTO11Y_AUTH_SECRET_ENV": "AGENTO11Y_SECRET",
+					}
+					value, ok := values[name]
+					return value, ok
+				},
+				func(string, string) (net.Listener, error) { listenCalls++; return nil, assert.AnError },
+				testLogger(),
+			)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.message)
+			assert.Zero(t, secretCalls)
+			assert.Zero(t, listenCalls)
+		})
+	}
 
 	t.Run("ambient agent observability environment before yaml", func(t *testing.T) {
 		secretCalls := 0
@@ -173,6 +213,7 @@ func TestRun_ValidatesScalarsAndEndpointsBeforeSecretsOrListener(t *testing.T) {
 }
 
 func TestRun_ResolvesAgentCredentialOnceBeforeListener(t *testing.T) {
+	unsetAmbientAgentObservabilityEnvironment(t)
 	path := writeProcessConfig(t, "https://provider.example")
 	agentSecretCalls := 0
 	listenCalls := 0
@@ -225,6 +266,7 @@ func TestRun_ResolvesAgentCredentialOnceBeforeListener(t *testing.T) {
 }
 
 func TestRun_HTTPAgentObservabilityConfigurationReachesListener(t *testing.T) {
+	unsetAmbientAgentObservabilityEnvironment(t)
 	collector := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	defer collector.Close()
 	path := writeProcessConfig(t, "http://provider.example")
@@ -273,57 +315,103 @@ func TestRun_HTTPAgentObservabilityConfigurationReachesListener(t *testing.T) {
 }
 
 func TestRun_LocalReadinessDoesNotProbeProvider(t *testing.T) {
-	var providerCalls atomic.Int64
-	providerServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		providerCalls.Add(1)
-	}))
-	defer providerServer.Close()
-	path := writeProcessConfig(t, providerServer.URL)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	addresses := make(chan string, 1)
-	result := make(chan error, 1)
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&logs, nil))
-	go func() {
-		result <- Run(
-			ctx,
-			[]string{"--deployment.mode=development", "--auth.unsafe", "--server.listen-address=127.0.0.1:0"},
-			func(name string) (string, bool) {
-				switch name {
-				case "GRAFANA_AI_GATEWAY_CONFIG_FILE":
-					return path, true
-				case "ANTHROPIC_SECRET":
-					return "secret-value", true
-				default:
-					return "", false
+	for _, tc := range []struct {
+		name     string
+		authArgs []string
+		split    bool
+	}{
+		{name: "internal unsafe", authArgs: []string{"--auth.unsafe"}},
+		{name: "internal split", split: true, authArgs: []string{"--auth.unsafe", "--server.operational-listen-address=127.0.0.1:0"}},
+		{name: "cloud without JWKS", split: true, authArgs: []string{"--server.operational-listen-address=127.0.0.1:0", "--auth.mode=cloud-gateway", "--auth.jwks-timeout=0s", "--auth.jwks-response-bytes=0", "--auth.jwks-max-keys=0", "--auth.jwks-max-age=0s", "--auth.jwks-refresh-interval=0s", "--server.write-timeout=155s"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var providerCalls atomic.Int64
+			providerServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				providerCalls.Add(1)
+			}))
+			defer providerServer.Close()
+			path := writeProcessConfig(t, providerServer.URL)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			addresses := make(chan string, 2)
+			result := make(chan error, 1)
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, nil))
+			go func() {
+				result <- Run(
+					ctx,
+					append([]string{"--deployment.mode=development", "--server.listen-address=127.0.0.1:0"}, tc.authArgs...),
+					func(name string) (string, bool) {
+						switch name {
+						case "GRAFANA_AI_GATEWAY_CONFIG_FILE":
+							return path, true
+						case "ANTHROPIC_SECRET":
+							return "secret-value", true
+						default:
+							return "", false
+						}
+					},
+					func(network, address string) (net.Listener, error) {
+						listener, err := net.Listen(network, address)
+						if err == nil {
+							addresses <- listener.Addr().String()
+						}
+						return listener, err
+					},
+					logger,
+				)
+			}()
+			var address string
+			select {
+			case address = <-addresses:
+			case err := <-result:
+				require.FailNow(t, "process exited before binding", "%v", err)
+			case <-time.After(2 * time.Second):
+				require.FailNow(t, "process did not bind")
+			}
+			operationalAddress := address
+			if tc.split {
+				select {
+				case operationalAddress = <-addresses:
+				case err := <-result:
+					require.FailNow(t, "process exited before operational bind", "%v", err)
+				case <-time.After(2 * time.Second):
+					require.FailNow(t, "operational listener did not bind")
 				}
-			},
-			func(network, address string) (net.Listener, error) {
-				listener, err := net.Listen(network, address)
-				if err == nil {
-					addresses <- listener.Addr().String()
+			}
+			require.Eventually(t, func() bool {
+				response, err := http.Get("http://" + operationalAddress + "/ready")
+				if err != nil {
+					return false
 				}
-				return listener, err
-			},
-			logger,
-		)
-	}()
-	address := <-addresses
-	require.Eventually(t, func() bool {
-		response, err := http.Get("http://" + address + "/ready")
-		if err != nil {
-			return false
-		}
-		defer func() { _ = response.Body.Close() }()
-		return response.StatusCode == http.StatusOK
-	}, 2*time.Second, 10*time.Millisecond)
-	assert.Zero(t, providerCalls.Load())
-	cancel()
-	require.NoError(t, <-result)
-	assert.Equal(t, []string{processEventStarting, processEventReady, processEventShutdownStarted, processEventShutdownCompleted}, processLifecycleEvents(t, logs.String()))
-	for _, private := range []string{"secret-value", providerServer.URL, "backend-private", "ANTHROPIC_SECRET"} {
-		assert.NotContains(t, logs.String(), private)
+				defer func() { _ = response.Body.Close() }()
+				return response.StatusCode == http.StatusOK
+			}, 2*time.Second, 10*time.Millisecond)
+			assert.Zero(t, providerCalls.Load())
+			if tc.split {
+				for _, url := range []string{"http://" + address + "/ready", "http://" + operationalAddress + "/api/v1/aisdk/config"} {
+					response, err := http.Get(url)
+					require.NoError(t, err)
+					_ = response.Body.Close()
+					assert.Equal(t, http.StatusNotFound, response.StatusCode)
+				}
+			}
+			if tc.name == "cloud without JWKS" {
+				request, err := http.NewRequest(http.MethodGet, "http://"+address+"/api/v1/aisdk/config", nil)
+				require.NoError(t, err)
+				request.Header.Set("X-Scope-OrgID", "123")
+				response, err := http.DefaultClient.Do(request)
+				require.NoError(t, err)
+				_ = response.Body.Close()
+				assert.Equal(t, http.StatusOK, response.StatusCode)
+			}
+			cancel()
+			require.NoError(t, <-result)
+			assert.Equal(t, []string{processEventStarting, processEventReady, processEventShutdownStarted, processEventShutdownCompleted}, processLifecycleEvents(t, logs.String()))
+			for _, private := range []string{"secret-value", providerServer.URL, "backend-private", "ANTHROPIC_SECRET"} {
+				assert.NotContains(t, logs.String(), private)
+			}
+		})
 	}
 }
 
@@ -337,25 +425,26 @@ func TestServe_FinalizesObservabilityBeforeProcessCompletionEvent(t *testing.T) 
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 	telemetry, err := service.NewTelemetry(testLogger())
 	require.NoError(t, err)
-	err = Serve(ctx, func() {}, &http.Server{}, listener, readiness, telemetry, logger, time.Second, func() {
+	err = Serve(ctx, func() {}, []boundServer{{server: &http.Server{}, listener: listener}}, readiness, telemetry, logger, time.Second, func() {
 		logProcessEvent(logger, "observability_finalized")
 	})
 	require.NoError(t, err)
 	assert.Equal(t, []string{
-		processEventReady,
 		processEventShutdownStarted,
 		"observability_finalized",
 		processEventShutdownCompleted,
 	}, processLifecycleEvents(t, logs.String()))
 }
 
-func TestServe_RejectsInvalidShutdownTimeoutBeforeStarting(t *testing.T) {
+func TestServe_RejectsInvalidDependenciesBeforeStarting(t *testing.T) {
 	tests := []struct {
 		name    string
 		timeout time.Duration
+		empty   bool
 	}{
 		{name: "zero", timeout: 0},
 		{name: "negative", timeout: -time.Second},
+		{name: "no servers", timeout: time.Second, empty: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -367,12 +456,15 @@ func TestServe_RejectsInvalidShutdownTimeoutBeforeStarting(t *testing.T) {
 			readiness := &service.Readiness{}
 			canceled := false
 			var logs bytes.Buffer
+			servers := []boundServer{{server: &http.Server{}, listener: listener}}
+			if tc.empty {
+				servers = nil
+			}
 
 			err = Serve(
 				context.Background(),
 				func() { canceled = true },
-				&http.Server{},
-				listener,
+				servers,
 				readiness,
 				telemetry,
 				slog.New(slog.NewJSONHandler(&logs, nil)),
@@ -410,7 +502,7 @@ func TestServe_CancelFirstGracefulAndForcedShutdown(t *testing.T) {
 		require.NoError(t, err)
 		result := make(chan error, 1)
 		go func() {
-			result <- Serve(signalContext, cancelRequests, server, listener, readiness, telemetry, testLogger(), time.Second, nil)
+			result <- Serve(signalContext, cancelRequests, []boundServer{{server: server, listener: listener}}, readiness, telemetry, testLogger(), time.Second, nil)
 		}()
 		go func() { _, _ = http.Get("http://" + listener.Addr().String()) }()
 		<-started
@@ -440,7 +532,7 @@ func TestServe_CancelFirstGracefulAndForcedShutdown(t *testing.T) {
 		require.NoError(t, err)
 		result := make(chan error, 1)
 		go func() {
-			result <- Serve(signalContext, cancelRequests, server, listener, readiness, telemetry, testLogger(), 50*time.Millisecond, nil)
+			result <- Serve(signalContext, cancelRequests, []boundServer{{server: server, listener: listener}}, readiness, telemetry, testLogger(), 50*time.Millisecond, nil)
 		}()
 		clientResult := make(chan error, 1)
 		go func() {
@@ -535,6 +627,316 @@ func processLifecycleEvents(t *testing.T, output string) []string {
 		events = append(events, event)
 	}
 	return events
+}
+
+func TestRun_BindFailures(t *testing.T) {
+	for _, failAt := range []int{1, 2} {
+		t.Run(fmt.Sprintf("listener %d", failAt), func(t *testing.T) {
+			path := writeProcessConfig(t, "https://provider.example")
+			var listeners []net.Listener
+			calls := 0
+			var logs bytes.Buffer
+			err := Run(context.Background(), []string{"--config.file=" + path, "--deployment.mode=development", "--auth.mode=cloud-gateway", "--server.listen-address=127.0.0.1:0", "--server.operational-listen-address=127.0.0.1:0"}, func(name string) (string, bool) { return "secret", name == "ANTHROPIC_SECRET" }, func(network, address string) (net.Listener, error) {
+				calls++
+				if calls == failAt {
+					return nil, assert.AnError
+				}
+				listener, err := net.Listen(network, address)
+				if err == nil {
+					listeners = append(listeners, listener)
+				}
+				return listener, err
+			}, slog.New(slog.NewJSONHandler(&logs, nil)))
+			require.ErrorIs(t, err, assert.AnError)
+			assert.Equal(t, failAt, calls)
+			assert.NotContains(t, processLifecycleEvents(t, logs.String()), processEventReady)
+			for _, listener := range listeners {
+				defer func() { _ = listener.Close() }()
+				connection, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+				if connection != nil {
+					_ = connection.Close()
+				}
+				require.Error(t, err)
+			}
+		})
+	}
+}
+
+func unsetAmbientAgentObservabilityEnvironment(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		"AGENTO11Y_ENDPOINT", "SIGIL_ENDPOINT", "AGENTO11Y_PROTOCOL", "SIGIL_PROTOCOL",
+		"AGENTO11Y_INSECURE", "SIGIL_INSECURE", "AGENTO11Y_HEADERS", "SIGIL_HEADERS",
+		"AGENTO11Y_AUTH_MODE", "SIGIL_AUTH_MODE", "AGENTO11Y_AUTH_TENANT_ID", "SIGIL_AUTH_TENANT_ID",
+		"AGENTO11Y_AUTH_TOKEN", "SIGIL_AUTH_TOKEN", "AGENTO11Y_AGENT_NAME", "SIGIL_AGENT_NAME",
+		"AGENTO11Y_AGENT_VERSION", "SIGIL_AGENT_VERSION", "AGENTO11Y_USER_ID", "SIGIL_USER_ID",
+		"AGENTO11Y_TAGS", "SIGIL_TAGS", "AGENTO11Y_CONTENT_CAPTURE_MODE", "SIGIL_CONTENT_CAPTURE_MODE",
+		"AGENTO11Y_DEBUG", "SIGIL_DEBUG", "AGENTO11Y_REDACT_INPUT_MESSAGES", "SIGIL_REDACT_INPUT_MESSAGES",
+	} {
+		t.Setenv(name, "")
+	}
+}
+
+func TestServe_DualLifecycle(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		failAt            int
+		ignoreCancel      bool
+		cancelBeforeStart bool
+		failAfterStartup  bool
+	}{
+		{name: "API failure", failAt: 1},
+		{name: "operational failure", failAt: 2},
+		{name: "API failure after startup", failAt: 1, failAfterStartup: true},
+		{name: "operational failure after startup", failAt: 2, failAfterStartup: true},
+		{name: "already canceled", cancelBeforeStart: true},
+		{name: "shared forced shutdown", ignoreCancel: true},
+		{name: "cancel-first graceful shutdown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, stop := context.WithCancel(context.Background())
+			defer stop()
+			requestContext, cancelRequests := context.WithCancel(context.Background())
+			defer cancelRequests()
+			readiness := &service.Readiness{}
+			telemetry, err := service.NewTelemetry(testLogger())
+			require.NoError(t, err)
+			started := make(chan struct{}, 2)
+			completed := make(chan struct{}, 2)
+			release := make(chan struct{})
+			defer close(release)
+			var servers []boundServer
+			for i := range 2 {
+				listener, err := net.Listen("tcp", "127.0.0.1:0")
+				require.NoError(t, err)
+				defer func() { _ = listener.Close() }()
+				if tc.failAt == i+1 {
+					listener = &failingListener{Listener: listener, acceptFirst: tc.failAfterStartup}
+				}
+				server := &http.Server{BaseContext: func(net.Listener) context.Context { return requestContext }, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					started <- struct{}{}
+					if tc.ignoreCancel {
+						<-release
+					} else {
+						<-r.Context().Done()
+						assert.False(t, readiness.Ready())
+					}
+					w.WriteHeader(http.StatusNoContent)
+				})}
+				servers = append(servers, boundServer{server: server, listener: listener})
+			}
+			var logs bytes.Buffer
+			if tc.cancelBeforeStart {
+				stop()
+			}
+			result := make(chan error, 1)
+			go func() {
+				result <- Serve(ctx, cancelRequests, servers, readiness, telemetry, slog.New(slog.NewJSONHandler(&logs, nil)), 200*time.Millisecond, nil)
+			}()
+			var shutdownStarted time.Time
+			if tc.failAt == 0 && !tc.cancelBeforeStart {
+				for _, binding := range servers {
+					go func() {
+						response, _ := http.Get("http://" + binding.listener.Addr().String())
+						if response != nil {
+							_ = response.Body.Close()
+						}
+						completed <- struct{}{}
+					}()
+				}
+				for range 2 {
+					select {
+					case <-started:
+					case <-time.After(2 * time.Second):
+						require.FailNow(t, "handler did not start")
+					}
+				}
+				shutdownStarted = time.Now()
+				stop()
+			}
+			select {
+			case err := <-result:
+				if tc.failAt > 0 {
+					require.ErrorIs(t, err, assert.AnError)
+				} else {
+					require.NoError(t, err)
+				}
+			case <-time.After(time.Second):
+				require.FailNow(t, "servers did not stop under shared deadline")
+			}
+			if tc.ignoreCancel {
+				assert.Less(t, time.Since(shutdownStarted), 350*time.Millisecond, "both servers share one deadline")
+			}
+			assert.False(t, readiness.Ready())
+			events := processLifecycleEvents(t, logs.String())
+			if (tc.failAt > 0 && !tc.failAfterStartup) || tc.cancelBeforeStart {
+				assert.Equal(t, []string{processEventShutdownStarted, processEventShutdownCompleted}, events)
+			} else {
+				assert.Equal(t, []string{processEventReady, processEventShutdownStarted, processEventShutdownCompleted}, events)
+			}
+			assert.ErrorIs(t, requestContext.Err(), context.Canceled)
+			for _, binding := range servers {
+				connection, err := net.DialTimeout("tcp", binding.listener.Addr().String(), time.Second)
+				if connection != nil {
+					_ = connection.Close()
+				}
+				require.Error(t, err)
+			}
+			if tc.failAt == 0 && !tc.cancelBeforeStart {
+				for range 2 {
+					select {
+					case <-completed:
+					case <-time.After(time.Second):
+						require.FailNow(t, "client connection survived shutdown")
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestServe_ListenerStartup(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		count        int
+		pauseAt      int
+		address      string
+		cancel       bool
+		timeout      bool
+		probeFailure bool
+	}{
+		{name: "combined", count: 1, pauseAt: 1, address: "127.0.0.1:0"},
+		{name: "API pending", count: 2, pauseAt: 1, address: "127.0.0.1:0"},
+		{name: "operational pending", count: 2, pauseAt: 2, address: "127.0.0.1:0"},
+		{name: "IPv4 wildcard", count: 1, pauseAt: 1, address: "0.0.0.0:0"},
+		{name: "IPv6 wildcard", count: 1, pauseAt: 1, address: "[::]:0"},
+		{name: "cancel pending startup", count: 2, pauseAt: 2, address: "127.0.0.1:0", cancel: true},
+		{name: "startup timeout", count: 2, pauseAt: 1, address: "127.0.0.1:0", timeout: true},
+		{name: "probe failure", count: 2, pauseAt: 2, address: "127.0.0.1:0", probeFailure: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, stop := context.WithCancel(context.Background())
+			defer stop()
+			requestContext, cancelRequests := context.WithCancel(context.Background())
+			defer cancelRequests()
+			readiness := &service.Readiness{}
+			telemetry, err := service.NewTelemetry(testLogger())
+			require.NoError(t, err)
+			var servers []boundServer
+			var paused *pausedListener
+			for i := range tc.count {
+				listener, err := net.Listen("tcp", tc.address)
+				require.NoError(t, err)
+				if i+1 == tc.pauseAt {
+					paused = &pausedListener{Listener: listener, entered: make(chan struct{}), resume: make(chan struct{}), closed: make(chan struct{})}
+					if tc.probeFailure {
+						paused.address = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: -1}
+					}
+					listener = paused
+				}
+				defer func() { _ = listener.Close() }()
+				servers = append(servers, boundServer{server: &http.Server{}, listener: listener})
+			}
+			var logs bytes.Buffer
+			result := make(chan error, 1)
+			go func() {
+				result <- Serve(ctx, cancelRequests, servers, readiness, telemetry, slog.New(slog.NewJSONHandler(&logs, nil)), time.Second, nil)
+			}()
+			if !tc.probeFailure {
+				select {
+				case <-paused.entered:
+				case <-time.After(time.Second):
+					require.FailNow(t, "listener did not enter Accept")
+				}
+			}
+			assert.False(t, readiness.Ready())
+			metrics := httptest.NewRecorder()
+			telemetry.Handler().ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+			assert.Contains(t, metrics.Body.String(), "grafana_ai_gateway_ready 0\n")
+			if tc.cancel {
+				stop()
+			} else if !tc.timeout && !tc.probeFailure {
+				close(paused.resume)
+				require.Eventually(t, func() bool {
+					metrics := httptest.NewRecorder()
+					telemetry.Handler().ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+					return readiness.Ready() && strings.Contains(metrics.Body.String(), "grafana_ai_gateway_ready 1\n")
+				}, time.Second, time.Millisecond)
+				stop()
+			}
+			wait := 2 * time.Second
+			if tc.timeout {
+				wait += listenerStartupTimeout
+			}
+			select {
+			case err := <-result:
+				if tc.timeout {
+					require.ErrorIs(t, err, context.DeadlineExceeded)
+				} else if tc.probeFailure {
+					require.ErrorContains(t, err, "probing listener")
+				} else {
+					require.NoError(t, err)
+				}
+			case <-time.After(wait):
+				require.FailNow(t, "startup did not stop")
+			}
+			assert.False(t, readiness.Ready())
+			assert.ErrorIs(t, requestContext.Err(), context.Canceled)
+			events := processLifecycleEvents(t, logs.String())
+			if tc.cancel || tc.timeout || tc.probeFailure {
+				assert.Equal(t, []string{processEventShutdownStarted, processEventShutdownCompleted}, events)
+			} else {
+				assert.Equal(t, []string{processEventReady, processEventShutdownStarted, processEventShutdownCompleted}, events)
+			}
+		})
+	}
+}
+
+type pausedListener struct {
+	net.Listener
+	entered chan struct{}
+	resume  chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+	address net.Addr
+}
+
+func (listener *pausedListener) Addr() net.Addr {
+	if listener.address != nil {
+		return listener.address
+	}
+	return listener.Listener.Addr()
+}
+
+func (listener *pausedListener) Accept() (net.Conn, error) {
+	if listener.entered != nil {
+		close(listener.entered)
+		select {
+		case <-listener.resume:
+		case <-listener.closed:
+			return nil, net.ErrClosed
+		}
+		listener.entered = nil
+	}
+	return listener.Listener.Accept()
+}
+
+func (listener *pausedListener) Close() error {
+	listener.once.Do(func() { close(listener.closed) })
+	return listener.Listener.Close()
+}
+
+type failingListener struct {
+	net.Listener
+	acceptFirst bool
+}
+
+func (listener *failingListener) Accept() (net.Conn, error) {
+	if listener.acceptFirst {
+		listener.acceptFirst = false
+		return listener.Listener.Accept()
+	}
+	return nil, assert.AnError
 }
 
 func testLogger() *slog.Logger {
