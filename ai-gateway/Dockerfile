@@ -59,7 +59,7 @@ LABEL org.opencontainers.image.title="Grafana AI Gateway" \
 COPY --from=build /out/grafana-ai-gateway /usr/local/bin/grafana-ai-gateway
 COPY --from=build /out/licenses /usr/share/licenses/grafana-ai-gateway
 
-USER gateway:gateway
+USER 10001:10001
 
 EXPOSE 8080
 

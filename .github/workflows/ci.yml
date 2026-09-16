@@ -212,6 +212,57 @@ jobs:
           AI_GATEWAY_VCS_REF: ${{ github.sha }}
         run: mise run build-ai-gateway-image
 
+      - name: Smoke test native image
+        timeout-minutes: 2
+        run: |
+          test "$(docker image inspect --format '{{.Config.User}}' ai-gateway:ci)" = '10001:10001'
+          config="$RUNNER_TEMP/ai-gateway-smoke.yaml"
+          printf '%s\n' \
+            'providers:' \
+            '  smoke:' \
+            '    type: anthropic' \
+            '    apiKeyEnv: ANTHROPIC_API_KEY' \
+            '    baseURL: http://127.0.0.1:1' \
+            'models:' \
+            '  smoke:' \
+            '    name: Smoke test' \
+            '    primary:' \
+            '      provider: smoke' \
+            '      model: smoke' > "$config"
+          chmod 644 "$config"
+          container=''
+          trap '
+            if [ -n "$container" ]; then
+              docker logs "$container" || true
+              docker rm --force "$container" || true
+            fi
+            rm -f "$config"
+          ' EXIT
+          container=$(docker run --detach \
+            --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --mount "type=bind,source=$config,target=/etc/gateway/models.yaml,readonly" \
+            --env GRAFANA_AI_GATEWAY_CONFIG_FILE=/etc/gateway/models.yaml \
+            --env ANTHROPIC_API_KEY=smoke-test-not-a-secret \
+            ai-gateway:ci --deployment.mode=development --auth.unsafe \
+            --server.listen-address=127.0.0.1:8080)
+          for ((attempt = 0; attempt < 30; attempt++)); do
+            if docker exec "$container" timeout 2 bash -c '
+              exec 3<>/dev/tcp/127.0.0.1/8080
+              printf "GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3
+              read -r status <&3
+              [[ "$status" == *" 200 "* ]]
+            '; then
+              exit 0
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' "$container")" != true ]; then
+              echo 'AI Gateway exited before becoming ready' >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          echo 'AI Gateway did not become ready within 30 attempts' >&2
+          exit 1
+
   conformance-test:
     runs-on: ubuntu-latest
     permissions:
