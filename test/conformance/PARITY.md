@@ -72,6 +72,23 @@ fixture becomes the executable contract for future upgrades.
 
 ### Grafana Go Gateway Client
 
+WP9 ordered fallback is a Grafana extension; the registered upstream baseline
+has no generic equivalent. Root regression tests cover first-part commitment
+(including provider errors), pre-commit failures, exact-once decisions,
+cancellation, and bounded cleanup. Gateway tests cover strict ordered route
+configuration, single logical composition, restart-at-primary semantics,
+zero-invocation effect rejection, private allowlisted records, bounded queue
+saturation/shutdown, supported socket deadlines, and logical-to-physical
+correlation. Real FIFO deadline tests are Linux-only; macOS verifies nonblocking
+sockets and fail-open rejection of blocking sockets without descriptor mutation.
+The real command matrix verifies JWKS-authenticated Go and registered Vercel
+discovery, unary/streaming primary success, secondary selection, non-retryable
+stop, exhaustion, preserved requests, and public/logical privacy. Gateway tests
+run with `GOWORK=off` against published root prerequisite `9dd11902673f`.
+These are deterministic service tests, not recorded provider fixtures. The full
+service cancellation/commitment matrix and production activation remain gates;
+the local macOS run does not verify Linux FIFO runtime behavior.
+
 `providers/grafana` is an Apache-licensed, independently buildable client for
 the text-only WP5 service, not a second Gateway implementation. Its focused Go
 tests cover explicit request projection, atomic discovery, authentication,
