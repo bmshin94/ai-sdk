@@ -14,12 +14,12 @@ import (
 func TestPhysicalSocketOutput_WriteDeadlineAndClose(t *testing.T) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	require.NoError(t, err)
-	defer unix.Close(fds[1])
+	defer func() { _ = unix.Close(fds[1]) }()
 	if runtime.GOOS != "linux" {
 		require.NoError(t, unix.SetNonblock(fds[0], true))
 	}
 	output := &physicalSocketOutput{fd: fds[0]}
-	defer output.Close()
+	defer func() { _ = output.Close() }()
 	require.NoError(t, output.SetWriteDeadline(time.Now().Add(time.Second)))
 	n, err := output.Write([]byte("record\n"))
 	require.NoError(t, err)
@@ -39,8 +39,8 @@ func TestPhysicalSocketOutput_WriteDeadlineAndClose(t *testing.T) {
 func TestPhysicalSocketOutput_BlockingDescriptorPolicyPreservesFlags(t *testing.T) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	require.NoError(t, err)
-	defer unix.Close(fds[0])
-	defer unix.Close(fds[1])
+	defer func() { _ = unix.Close(fds[0]) }()
+	defer func() { _ = unix.Close(fds[1]) }()
 	before, err := unix.FcntlInt(uintptr(fds[0]), unix.F_GETFL, 0)
 	require.NoError(t, err)
 	if runtime.GOOS == "linux" {

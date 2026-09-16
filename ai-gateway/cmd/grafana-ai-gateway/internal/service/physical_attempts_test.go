@@ -71,7 +71,7 @@ func TestPhysicalAttempts_AllowlistedProjectionAndImmutableIdentity(t *testing.T
 
 func TestPhysicalAttempts_BoundedSaturationShutdownAndConcurrentClose(t *testing.T) {
 	writer, reader := net.Pipe()
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	telemetry, err := NewTelemetry(slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	require.NoError(t, err)
 	sink := newPhysicalAttemptSink(writer, telemetry, 2, 20*time.Millisecond, 30*time.Millisecond)
@@ -104,7 +104,7 @@ func TestPhysicalAttempts_RealPipeWriteDeadline(t *testing.T) {
 	}
 	reader, writer, err := os.Pipe()
 	require.NoError(t, err)
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	require.NoError(t, writer.SetWriteDeadline(time.Now().Add(10*time.Millisecond)))
 	_, err = writer.Write(make([]byte, 4<<20))
 	require.Error(t, err)
