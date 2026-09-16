@@ -4,9 +4,12 @@ The repository builds a container for the standalone `grafana-ai-gateway`
 command. The image keeps the Gateway module outside the root Go workspace and
 uses the versions pinned in `ai-gateway/go.mod`.
 
-Pushing an `ai-gateway/v*` Git tag to `grafana/ai-sdk` publishes an image after all CI checks pass.
-For example, `ai-gateway/v0.1.0` publishes `ghcr.io/grafana/ai-gateway:v0.1.0` for Linux AMD64 and ARM64.
-The workflow does not update `latest`.
+After all required CI checks pass, pushes to `grafana/ai-sdk` publish Linux AMD64 and ARM64 images:
+
+- Pushes to `main` publish `ghcr.io/grafana/ai-gateway:sha-<full-commit-sha>` for the pushed HEAD commit.
+- Git tags matching `ai-gateway/v*` publish release images. For example, `ai-gateway/v0.1.0` publishes `ghcr.io/grafana/ai-gateway:v0.1.0`.
+
+The workflow does not publish moving `main` or `latest` tags.
 
 ## Build the image
 
