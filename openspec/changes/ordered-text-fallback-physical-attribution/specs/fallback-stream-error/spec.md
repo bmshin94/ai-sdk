@@ -3,6 +3,18 @@
 ### Requirement: First-chunk error detection in DoStream
 `fallback.Model.DoStream` SHALL wait for each candidate's first stream result before returning. A synchronous setup error, invalid nil result/channel, or channel close before any part SHALL remain a pre-commit candidate failure and SHALL be evaluated by the fallback decider. Receipt of any `provider.StreamPart`, including `PartError`, SHALL irrevocably select that candidate and SHALL NOT be evaluated by the decider.
 
+#### Scenario: Primary streams PartError, secondary succeeds
+- **WHEN** the primary candidate's first part is `PartError` and a secondary candidate would succeed if invoked
+- **THEN** fallback SHALL return the primary stream beginning with that exact error part and SHALL NOT invoke the secondary candidate
+
+#### Scenario: Primary streams PartError, decider rejects fallback
+- **WHEN** the primary candidate's first part is `PartError` and the configured decider would reject its error
+- **THEN** fallback SHALL return the primary stream without invoking the decider or any further candidate
+
+#### Scenario: All candidates stream PartError
+- **WHEN** every configured candidate would emit `PartError` as its first part
+- **THEN** fallback SHALL select only the first candidate and return its error part without invoking later candidates
+
 #### Scenario: Primary streams PartError
 - **WHEN** the primary candidate returns a valid stream whose first part is `PartError`
 - **THEN** fallback SHALL return a stream beginning with that exact part and SHALL NOT invoke the secondary candidate
@@ -18,6 +30,14 @@
 ### Requirement: Valid first chunk replay
 After a candidate yields its first part, `fallback.Model.DoStream` SHALL return a stream that emits the buffered part exactly once followed by all later parts from that candidate in original order. It SHALL never combine parts from different candidates.
 
+#### Scenario: Primary succeeds with valid first chunk
+- **WHEN** the primary candidate's stream emits a valid `PartTextDelta` as its first part
+- **THEN** fallback SHALL return that part exactly once followed by all subsequent parts in original order, without invoking a secondary candidate
+
+#### Scenario: Primary stream is empty
+- **WHEN** the primary candidate returns a stream channel that closes before yielding any part
+- **THEN** fallback SHALL treat the premature end as a pre-commit failure rather than successful empty output, and SHALL invoke the next candidate only if the decider accepts and the request context remains live
+
 #### Scenario: Primary yields normal text parts
 - **WHEN** the primary stream yields a text start followed by deltas and finish
 - **THEN** the returned stream SHALL yield every part exactly once in original order and no secondary SHALL be invoked
@@ -28,6 +48,10 @@ After a candidate yields its first part, `fallback.Model.DoStream` SHALL return 
 
 ### Requirement: Failed stream cleanup
 Fallback SHALL create a cancelable context per physical stream attempt. When an attempt is abandoned before commitment, it SHALL cancel that context immediately and perform only asynchronous cleanup bounded by a positive package-owned duration and part budget. The successful relay SHALL select on cancellation for every send and receive. Cleanup or relay SHALL close only fallback-owned output channels and SHALL not require an uncooperative provider channel to close.
+
+#### Scenario: Stream drained after PartError
+- **WHEN** a selected candidate emits `PartError` followed by additional parts before closing
+- **THEN** fallback SHALL relay those parts to the caller in order rather than discard them as failed-attempt cleanup, and SHALL cancel the selected candidate if the caller cancels
 
 #### Scenario: Abandoned producer cooperates
 - **WHEN** a pre-commit candidate is abandoned and its producer closes after observing cancellation
@@ -44,6 +68,14 @@ Fallback SHALL create a cancelable context per physical stream attempt. When an 
 ### Requirement: Decider applied to stream errors
 The configured decider SHALL run exactly once for each synchronous setup error, invalid stream result, or premature EOF while the request context is live. It SHALL NOT inspect or decide on a received provider `PartError`. Fallback SHALL invoke a later candidate only when the decider returns true and a later candidate exists.
 
+#### Scenario: Stream error with context length message
+- **WHEN** a candidate's first part is `PartError` whose error message contains "context length"
+- **THEN** fallback SHALL select that candidate, relay the error part, and SHALL NOT invoke the decider or a later candidate
+
+#### Scenario: Stream error with generic message
+- **WHEN** a candidate's first part is `PartError` whose error message is "model not found"
+- **THEN** fallback SHALL select that candidate, relay the error part, and SHALL NOT invoke the decider or a later candidate
+
 #### Scenario: Retryable setup API error
 - **WHEN** a candidate's `DoStream` returns a retryable `APICallError` before exposing a stream
 - **THEN** the default decider SHALL allow the next configured candidate
@@ -58,6 +90,10 @@ The configured decider SHALL run exactly once for each synchronous setup error, 
 
 ### Requirement: Context cancellation during stream peek
 If the request context ends while fallback waits for a first part, fallback SHALL cancel the current candidate, SHALL NOT invoke a later candidate, and SHALL return the context error or the accumulated failure preserving that cause. Cleanup SHALL remain asynchronous and bounded.
+
+#### Scenario: Context cancelled during first chunk read
+- **WHEN** the request context is cancelled while `DoStream` waits for a candidate's first part
+- **THEN** fallback SHALL promptly return an error preserving the context cause, cancel the candidate, and SHALL NOT invoke another candidate
 
 #### Scenario: Context canceled during first-part wait
 - **WHEN** the request context is canceled while `DoStream` waits for a candidate's first part

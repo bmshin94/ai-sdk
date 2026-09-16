@@ -70,7 +70,10 @@ jobs:
           echo "completed=$completed" >> "$GITHUB_OUTPUT"
           echo "total=$total" >> "$GITHUB_OUTPUT"
 
-          validate_json=$(openspec validate "$name" --type change --json)
+          if ! validate_json=$(openspec validate "$name" --type change --json); then
+            echo "$validate_json"
+            exit 1
+          fi
           valid=$(echo "$validate_json" | jq -r '.items[0].valid')
           echo "valid=$valid" >> "$GITHUB_OUTPUT"
 
