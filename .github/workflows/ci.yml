@@ -335,7 +335,7 @@ jobs:
     name: Publish AI Gateway image
     if: >-
       ${{ github.event_name == 'push' &&
-          startsWith(github.ref, 'refs/tags/ai-gateway/v') &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/ai-gateway/v')) &&
           github.repository == 'grafana/ai-sdk' }}
     needs:
       - ci
@@ -354,14 +354,18 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Validate image tag
+      - name: Select image tag
         id: image
         shell: bash
         run: |
-          tag="${GITHUB_REF_NAME#ai-gateway/}"
-          if [[ ! "$tag" =~ ^v[0-9][A-Za-z0-9_.-]*$ || ${#tag} -gt 128 ]]; then
-            echo "Invalid image tag: $tag" >&2
-            exit 1
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            tag="sha-$GITHUB_SHA"
+          else
+            tag="${GITHUB_REF_NAME#ai-gateway/}"
+            if [[ ! "$tag" =~ ^v[0-9][A-Za-z0-9_.-]*$ || ${#tag} -gt 128 ]]; then
+              echo "Invalid image tag: $tag" >&2
+              exit 1
+            fi
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
