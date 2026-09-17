@@ -1,6 +1,6 @@
 ## 1. Rebase and Contract Baseline
 
-- [x] 1.1 Reconcile the synthetic integration base `f40ba33` with accepted WP7 merge `ff25ba9` and WP8 merge `4f597f3`: the WP7 client implementation and WP8 observation/factory seams match; retain the service-local correlation accessor without reading private context keys. Final PR retarget/restack and validation of that rewritten head remain release workflow work, not a claim that this branch already descends from those merge commits.
+- [x] 1.1 Reconcile the synthetic integration base `f40ba33` with accepted WP7 merge `ff25ba9` and WP8 merge `4f597f3`: the WP7 client implementation and WP8 observation/factory seams match; retain the service-local correlation accessor without reading private context keys. The final branch is retargeted and restacked on `main` at `1877271`, including the subsequently merged cloud-auth and OpenAI-compatible Gateway work.
 - [x] 1.2 Confirm `test/conformance/upstream.yaml` still pins `ai@7.0.65`, `@ai-sdk/gateway@4.0.52`, and Vercel commit `d76eb85a9a7f2dbe44ab2f3dc858ad5cdcb5242e`; record that the pinned upstream tree has no generic client-side ordered fallback primitive and classify WP9 as a Grafana extension that preserves ProviderWire bytes.
 - [x] 1.3 Record the disposition of the original test-first process requirement: historical red-before-implementation evidence is unavailable and is not claimed. Current primitive regression tests and the composed acceptance suite establish behavior, not historical execution order; retain this explicit process deviation in the archive.
 
@@ -73,3 +73,9 @@ provider-owned invocation goroutines until they return. Public protocol-defined
 content and `finishReason.raw` remain successful result fields; privacy tests
 target credentials, error details and provider-private metadata rather than
 silently changing that existing protocol contract.
+
+Final publication evidence: the dependency-order stack was replayed onto
+`main` at `1877271`. The cumulative head passes Gateway ProviderWire,
+service/config/process race tests; the 26-test real-command matrix including
+cloud-auth and OpenAI-compatible composition; the full registered-upstream
+parity pipeline; and all 67 strict canonical OpenSpec specifications.
