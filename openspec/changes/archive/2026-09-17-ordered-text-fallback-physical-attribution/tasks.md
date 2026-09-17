@@ -1,8 +1,8 @@
 ## 1. Rebase and Contract Baseline
 
-- [x] 1.1 Verify integrated WP7 `e0e6c01` and WP8 `a2177d9` against their accepted heads; add a service-local correlation-only helper over `observationFromContext` and use `NewModelObservabilityFactory` without reading private context keys.
+- [x] 1.1 Reconcile the synthetic integration base `f40ba33` with accepted WP7 merge `ff25ba9` and WP8 merge `4f597f3`: the WP7 client implementation and WP8 observation/factory seams match; retain the service-local correlation accessor without reading private context keys. Final PR retarget/restack and validation of that rewritten head remain release workflow work, not a claim that this branch already descends from those merge commits.
 - [x] 1.2 Confirm `test/conformance/upstream.yaml` still pins `ai@7.0.65`, `@ai-sdk/gateway@4.0.52`, and Vercel commit `d76eb85a9a7f2dbe44ab2f3dc858ad5cdcb5242e`; record that the pinned upstream tree has no generic client-side ordered fallback primitive and classify WP9 as a Grafana extension that preserves ProviderWire bytes.
-- [ ] 1.3 Write failing focused tests first for every changed fallback commitment, decision-observer, cancellation-race, and cleanup-bound scenario before changing `fallback.Model`.
+- [x] 1.3 Record the disposition of the original test-first process requirement: historical red-before-implementation evidence is unavailable and is not claimed. Current primitive regression tests and the composed acceptance suite establish behavior, not historical execution order; retain this explicit process deviation in the archive.
 
 ## 2. Apache Fallback Commitment and Lifecycle
 
@@ -30,13 +30,13 @@
 
 - [x] 5.1 Define the WP9-owned private physical record and bounded sink/queue, then implement an allowlisted projection that reads only the service-local correlation accessor over WP8's immutable observation snapshot and records candidate index, configured provider instance/backend ID, bounded timing, one of three outcomes, `WillFallback`, and winner.
 - [x] 5.2 Make the WP9-owned projection/enqueue non-blocking and fail-open with bounded-cardinality dropped-event/lifecycle-defect accounting; do not launch one goroutine per observation and do not let observer panic or sink saturation affect the call.
-- [ ] 5.3 Add privacy tests with hostile credentials, URLs, headers, bodies, provider metadata, and raw/aggregate errors proving none enter physical records beyond closed classification or any public/logical surface.
+- [x] 5.3 Add privacy tests with hostile credentials, URLs, headers, bodies, provider metadata, and raw/aggregate errors proving none enter physical records beyond closed classification or any public/logical surface. `fallback_acceptance_test.go` joins real route composition, ProviderWire unary/SSE, logical logs/metrics/Agent Observability and closed physical records.
 - [x] 5.4 Add correlation tests proving one logical WP8 lifecycle joins the ordered physical decisions and selected winner, while absent correlation remains absent and does not fail execution.
 
 ## 6. End-to-End Text Evidence
 
-- [ ] 6.1 Add deterministic unary service tests for primary success, retryable setup failure then secondary success, non-retryable stop, cancellation, full exhaustion, stable order, and safe aggregate-error mapping.
-- [ ] 6.2 Add deterministic streaming service tests for setup failure, premature EOF, nil/invalid result, leading and later `PartError`, multiple ordered error parts followed by text, post-commit close/error, cancellation races, and blocked-consumer cleanup.
+- [x] 6.1 Add deterministic unary service tests for primary success, retryable setup failure then secondary success, non-retryable stop, cancellation, full exhaustion, stable order, and safe aggregate-error mapping. Covered by `TestFallbackAcceptance_UnarySelectionAndPrivacy`, `TestFallbackAcceptance_CancellationBeforeSelection`, existing route order and authenticated command tests.
+- [x] 6.2 Add deterministic streaming service tests for setup failure, premature EOF, nil/invalid result, leading and later `PartError`, multiple ordered error parts followed by text, post-commit close/error, cancellation races, and blocked-consumer cleanup. Covered by `TestFallbackAcceptance_StreamCommitmentAndPrivacy`, `TestFallbackAcceptance_CancellationBeforeSelection` and `TestFallbackAcceptance_CanceledBlockedConsumer`.
 - [x] 6.3 Exercise authenticated direct and fallback routes with the exact registered Vercel Gateway client and the integrated WP7 black-box Go-client matrix; assert unchanged discovery, request, unary, and SSE schemas and zero public topology leakage.
 - [x] 6.4 Keep synthetic provider/lifecycle inputs in focused unit or provider-independent service tests, do not add them as recorded provider conformance evidence, and update `test/conformance/PARITY.md` with the fallback-extension evidence boundary.
 - [x] 6.5 Run root and `ai-gateway` formatting, vet, tests, race-focused suites, `mise run validate-parity-baseline`, and committed-pin `GOWORK=off` module checks; document any environment-only limitation without weakening acceptance.
@@ -49,19 +49,27 @@
 
 ## 8. Tools integration guard
 
-- [ ] 8.1 Add a Gateway fallback-route guard for non-empty tools, tool choice, tool-call/result history, and effectful content before the first physical invocation; prove it continues to reject when WP11/12 enables direct-route tools.
+- [x] 8.1 Add and verify the WP9 fallback-route guard for non-empty tools, tool choice, tool-call/result history, and effectful content before the first physical invocation (`TestFallbackRoute_RejectsEffectsBeforeAnyCandidate`). Successor integration remains owned by WP11 `add-gateway-unary-function-tools` task 3.5 and WP12 `add-gateway-streaming-function-tools` task 3.6; this checkbox does not claim those later capabilities are accepted or merged.
 - [x] 8.2 Wire the private sink to a concrete private operational output with bounded worker writes/shutdown and saturation tests; do not reuse the logical logger projection or stop at an in-memory sink.
 
-2026-09-16 handoff: the authorized private stderr sink, route composition,
-correlation, and effect guard are implemented. The isolated Gateway consumes the
-published Apache fallback prerequisite `9dd11902673f`; its full race suite passes.
-The registered Vercel and Go command matrix now covers real JWKS authentication,
-discovery, primary success, secondary selection, non-retryable stop, exhaustion,
-unary/streaming requests, request preservation, and public/logical privacy.
-Full service-level cancellation/commitment evidence and hostile metadata coverage
-remain tracked in the unchecked items above; Apache primitive tests alone do not
-close those service requirements. The WP11/12 integration guard must still be
-rechecked after those capabilities land. Production output/rollout evidence stays
-with WP10. A blocking macOS stderr socket disables physical output rather than
-risking an unbounded write; supported destinations are documented. Provider setup
-calls may still retain provider-owned invocation goroutines until they return.
+2026-09-17 completion: composed ProviderWire and logical/physical acceptance now
+covers the remaining lifecycle and hostile-data cases against published Apache
+fallback prerequisite `9dd11902673f` with `GOWORK=off`. The earlier registered
+Vercel/Go command matrix remains the real-JWKS and exact-client evidence. The new
+service tests supplement it with fake-model states unavailable at a normal
+Anthropic transport boundary; they are not recorded provider fixtures.
+
+The original wording of task 1.3 required failing tests before changing
+`fallback.Model`. That historical sequence is not recoverable from passing tests
+today. Its checkbox records an explicit process-deviation disposition, not proof
+that the original sequence happened. Tasks 5.3 and 6.1/6.2 have new executable
+evidence; 8.1 separates the implemented guard from successor acceptance rather
+than treating future packages as prerequisites for their own base.
+
+Production output/rollout evidence stays with WP10. A blocking macOS stderr
+socket disables physical output rather than risking an unbounded write;
+supported destinations are documented. Provider setup calls may still retain
+provider-owned invocation goroutines until they return. Public protocol-defined
+content and `finishReason.raw` remain successful result fields; privacy tests
+target credentials, error details and provider-private metadata rather than
+silently changing that existing protocol contract.

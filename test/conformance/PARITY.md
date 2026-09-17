@@ -85,9 +85,14 @@ The real command matrix verifies JWKS-authenticated Go and registered Vercel
 discovery, unary/streaming primary success, secondary selection, non-retryable
 stop, exhaustion, preserved requests, and public/logical privacy. Gateway tests
 run with `GOWORK=off` against published root prerequisite `9dd11902673f`.
-These are deterministic service tests, not recorded provider fixtures. The full
-service cancellation/commitment matrix and production activation remain gates;
-the local macOS run does not verify Linux FIFO runtime behavior.
+`fallback_acceptance_test.go` additionally exercises the configured fallback
+under the real logical chain and ProviderWire unary/SSE mapping: invalid/empty
+stream setup, error-part commitment/order, cancellation with a ready result,
+silent/continuously ready blocked-consumer cleanup, aggregate error privacy,
+hostile headers/bodies/provider metadata, one logical generation and closed
+physical winner records. These are deterministic service tests, not recorded
+provider fixtures. Production activation remains WP10 work; the local macOS run
+does not verify Linux FIFO runtime behavior.
 
 `providers/grafana` is an Apache-licensed, independently buildable client for
 the text-only WP5 service, not a second Gateway implementation. Its focused Go
