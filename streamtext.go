@@ -200,24 +200,7 @@ func (r *StreamTextResult) ToUIMessageStream(opts ...UIMessageStreamOption) <-ch
 			}
 		}
 		if cfg.onFinish != nil {
-			respMsg := assembleResponseMessageForFinish(messageID, assembledChunks, cfg)
-			isContinuation := false
-			if last := lastOriginalAssistantMessage(cfg); last != nil {
-				isContinuation = respMsg.ID == last.ID
-			}
-			messages := append([]UIMessage{}, cfg.originalMessages...)
-			if isContinuation && len(messages) > 0 {
-				messages = append(messages[:len(messages)-1], respMsg)
-			} else {
-				messages = append(messages, respMsg)
-			}
-			cfg.onFinish(UIMessageStreamOnFinishState{
-				Messages:        messages,
-				IsContinuation:  isContinuation,
-				IsAborted:       isAborted,
-				ResponseMessage: respMsg,
-				FinishReason:    finishReason,
-			})
+			cfg.onFinish(buildUIMessageStreamFinishState(messageID, assembledChunks, cfg, finishReason, isAborted))
 		}
 	}()
 	return out
@@ -251,11 +234,37 @@ func lastOriginalAssistantMessage(cfg uiMessageStreamConfig) *UIMessage {
 	return &last
 }
 
-func assembleResponseMessageForFinish(messageID string, chunks []UIMessageChunk, cfg uiMessageStreamConfig) UIMessage {
+func assembleResponseMessageForFinish(messageID string, chunks []UIMessageChunk, cfg uiMessageStreamConfig) (UIMessage, error) {
 	if last := lastOriginalAssistantMessage(cfg); last != nil {
 		return assembleResponseMessageWithInitial(messageID, chunks, last)
 	}
 	return assembleResponseMessage(messageID, chunks)
+}
+
+// buildUIMessageStreamFinishState assembles the OnFinish state for a UI message
+// stream, replacing the last original message when the response continues it.
+func buildUIMessageStreamFinishState(messageID string, chunks []UIMessageChunk, cfg uiMessageStreamConfig, finishReason provider.FinishReason, isAborted bool) UIMessageStreamOnFinishState {
+	respMsg, assembleErr := assembleResponseMessageForFinish(messageID, chunks, cfg)
+	isContinuation := false
+	if last := lastOriginalAssistantMessage(cfg); last != nil {
+		isContinuation = respMsg.ID == last.ID
+	}
+	messages := append([]UIMessage{}, cfg.originalMessages...)
+	// A continuation implies a last original assistant message, so messages is
+	// never empty here.
+	if isContinuation {
+		messages = append(messages[:len(messages)-1], respMsg)
+	} else {
+		messages = append(messages, respMsg)
+	}
+	return UIMessageStreamOnFinishState{
+		Messages:        messages,
+		IsContinuation:  isContinuation,
+		IsAborted:       isAborted,
+		ResponseMessage: respMsg,
+		FinishReason:    finishReason,
+		AssemblyError:   assembleErr,
+	}
 }
 
 func messageMetadataForPart(part TextStreamPart, cfg uiMessageStreamConfig) json.RawMessage {
